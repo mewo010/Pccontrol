@@ -13,7 +13,7 @@ export const PROJECT_FILES: ProjectFile[] = [
     name: 'Cargo.toml',
     language: 'toml',
     category: 'rust',
-    description: 'Rust Host dependencies: Tokio, DXGI capture, Enigo, Image, Serde, and whoami',
+    description: 'Rust Host dependencies: Tokio, DXGI capture (v1.2.2), Enigo (v0.6), Image, and Serde',
     content: `[package]
 name = "remote_pc_host"
 version = "1.0.0"
@@ -24,13 +24,12 @@ description = "High-performance Windows DXGI GPU Screen Mirroring & Remote Input
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = "0.23"
-dxgi-capture-rs = "0.1"
-enigo = "0.2"
+dxgi-capture-rs = "1.2.2"
+enigo = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
-whoami = "1.5"
 
 [profile.release]
 opt-level = 3
@@ -223,9 +222,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 3. Auto-detect LAN IP and Device Name
     let local_lan_ip = get_local_lan_ip();
-    let host_name = whoami::devicename_os()
-        .into_string()
-        .unwrap_or_else(|_| "Windows-PC".to_string());
+    let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".to_string());
 
     // 4. Start UDP Discovery Beacon so mobile app discovers PC with 1 click
     start_udp_discovery_beacon(local_lan_ip.clone(), host_name.clone());

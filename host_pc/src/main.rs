@@ -178,9 +178,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 3. Auto-detect LAN IP
     let local_lan_ip = get_local_lan_ip();
-    let host_name = whoami::devicename_os()
-        .into_string()
-        .unwrap_or_else(|_| "Windows-PC".to_string());
+    let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".to_string());
 
     // 4. Start UDP Discovery Beacon so mobile app discovers PC with 1 click
     start_udp_discovery_beacon(local_lan_ip.clone(), host_name.clone());

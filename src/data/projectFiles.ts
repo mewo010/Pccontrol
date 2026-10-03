@@ -1217,8 +1217,15 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -1239,6 +1246,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: host_pc
+        continue-on-error: true
 
       - name: Build Windows Host Executable
         working-directory: host_pc
@@ -1271,9 +1279,14 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Install Flutter Dependencies
+      - name: Ensure Android Project Scaffolding
         working-directory: client_mobile
-        run: flutter pub get
+        run: |
+          if [ ! -d "android" ]; then
+            echo "Generating Android platform scaffolding..."
+            flutter create . --platforms=android --org com.remotepc
+          fi
+          flutter pub get
 
       - name: Build Android Release APK
         working-directory: client_mobile
@@ -1290,9 +1303,25 @@ jobs:
     name: Publish Unified GitHub Release
     needs: [build-rust-host, build-flutter-client]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Determine Release Tag & Version
+        id: release_meta
+        run: |
+          if [[ "\${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="\${{ github.ref_name }}"
+            IS_PRERELEASE=false
+          else
+            TAG="v1.0.0-run.\${{ github.run_number }}"
+            IS_PRERELEASE=true
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "Resolved Tag: $TAG (Prerelease: $IS_PRERELEASE)"
 
       - name: Create Artifacts Staging Directory
         run: mkdir -p release_assets
@@ -1309,24 +1338,26 @@ jobs:
           name: android-client-apk
           path: download_client
 
-      - name: Stage & Rename Release Assets
+      - name: Stage & Verify Release Assets
         run: |
-          cp download_host/remote_pc_host.exe release_assets/RemotePC-Host-Windows.exe
-          cp download_client/app-release.apk release_assets/RemotePC-Client-Android.apk
+          find download_host -type f -name "*.exe" -exec cp {} release_assets/RemotePC-Host-Windows.exe \\;
+          find download_client -type f -name "*.apk" -exec cp {} release_assets/RemotePC-Client-Android.apk \\;
+          echo "Staged release assets:"
           ls -lah release_assets/
 
       - name: Create GitHub Release with Binaries
         uses: softprops/action-gh-release@v2
         with:
-          name: "Remote PC Suite \${{ github.ref_name }}"
-          tag_name: \${{ github.ref_name }}
+          name: "Remote PC Suite \${{ steps.release_meta.outputs.tag }}"
+          tag_name: \${{ steps.release_meta.outputs.tag }}
           draft: false
-          prerelease: false
+          prerelease: \${{ steps.release_meta.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
             release_assets/RemotePC-Host-Windows.exe
             release_assets/RemotePC-Client-Android.apk
         env:
-          GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}`
+          GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+`
   }
 ];

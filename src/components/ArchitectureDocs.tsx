@@ -250,13 +250,15 @@ export const ArchitectureDocs: React.FC = () => {
         </div>
 
         <p className="text-xs text-slate-300 leading-relaxed">
-          The included GitHub Actions workflow (<code className="text-purple-300 font-mono">.github/workflows/build-release.yml</code>) automatically builds both the Windows host binary and the Android APK in parallel on hosted runners whenever a tag starting with <code className="text-sky-300 font-mono">v*</code> is pushed.
+          The updated GitHub Actions workflow (<code className="text-purple-300 font-mono">.github/workflows/build-release.yml</code>) now triggers on <strong>any push to main/master</strong>, pull requests, manual <strong>&quot;Run workflow&quot;</strong> clicks, or when pushing a <code className="text-sky-300 font-mono">v*</code> release tag.
         </p>
 
-        <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 font-mono text-xs text-sky-300 space-y-1">
-          <div># Tag the repository and trigger GitHub Actions build matrix:</div>
-          <div className="text-emerald-400 font-bold">git tag v1.0.0</div>
-          <div className="text-emerald-400 font-bold">git push origin v1.0.0</div>
+        <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 font-mono text-xs text-sky-300 space-y-1.5">
+          <div className="text-slate-400"># Option A: Push any commit to main (triggers build automatically):</div>
+          <div className="text-emerald-400 font-bold">git push origin main</div>
+          <div className="text-slate-400 pt-1"># Option B: Push a official version release tag:</div>
+          <div className="text-emerald-400 font-bold">git tag v1.0.0 &amp;&amp; git push origin v1.0.0</div>
+          <div className="text-slate-400 pt-1"># Option C: Go to your GitHub Repo &gt; Actions tab &gt; click &quot;Run workflow&quot;</div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-300 pt-2">

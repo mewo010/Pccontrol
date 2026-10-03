@@ -1,0 +1,115 @@
+name: Build & Release Cross-Platform Suite
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-rust-host:
+    name: Build Windows Host (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host_pc
+
+      - name: Build Windows Host Executable
+        working-directory: host_pc
+        run: cargo build --release
+
+      - name: Upload Windows Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-host-binary
+          path: host_pc/target/release/remote_pc_host.exe
+          if-no-files-found: error
+
+  build-flutter-client:
+    name: Build Android Client (.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Install Flutter Dependencies
+        working-directory: client_mobile
+        run: flutter pub get
+
+      - name: Build Android Release APK
+        working-directory: client_mobile
+        run: flutter build apk --release
+
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-client-apk
+          path: client_mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+  create-github-release:
+    name: Publish Unified GitHub Release
+    needs: [build-rust-host, build-flutter-client]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create Artifacts Staging Directory
+        run: mkdir -p release_assets
+
+      - name: Download Windows Host Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-host-binary
+          path: download_host
+
+      - name: Download Android Client Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-client-apk
+          path: download_client
+
+      - name: Stage & Rename Release Assets
+        run: |
+          cp download_host/remote_pc_host.exe release_assets/RemotePC-Host-Windows.exe
+          cp download_client/app-release.apk release_assets/RemotePC-Client-Android.apk
+          ls -lah release_assets/
+
+      - name: Create GitHub Release with Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Remote PC Suite ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release_assets/RemotePC-Host-Windows.exe
+            release_assets/RemotePC-Client-Android.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

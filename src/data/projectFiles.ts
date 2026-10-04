@@ -180,76 +180,165 @@ fn get_local_lan_ip() -> String {
 
 /// Spawns a native Windows GUI window displaying the PC's IP and connection status
 fn spawn_gui_window(local_ip: &str, host_name: &str) {
-    let full_ip = format!("{}:8765", local_ip);
-    let xaml = format!(
-        r#"<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="Remote PC Controller - Host Server" Height="360" Width="470"
-        WindowStartupLocation="CenterScreen" Background="#0F172A" ResizeMode="CanMinimize">
-    <Grid Margin="20">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,16">
-            <Border Width="12" Height="12" CornerRadius="6" Background="#22C55E" Margin="0,0,10,0" VerticalAlignment="Center"/>
-            <TextBlock Text="Server Running &amp; Mirroring Active" Foreground="#F8FAFC" FontSize="15" FontWeight="Bold" VerticalAlignment="Center"/>
-        </StackPanel>
-
-        <Border Grid.Row="1" Background="#1E293B" CornerRadius="10" Padding="14" BorderBrush="#334155" BorderThickness="1">
-            <StackPanel>
-                <TextBlock Text="YOUR PC LOCAL IP ADDRESS (ENTER IN PHONE APP):" Foreground="#94A3B8" FontSize="11" FontWeight="Bold" Margin="0,0,0,6"/>
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBox Name="IpBox" Grid.Column="0" Text="{full_ip}" IsReadOnly="True" Background="#0F172A" Foreground="#38BDF8" FontSize="18" FontWeight="Bold" Padding="8,4" BorderBrush="#38BDF8" BorderThickness="1"/>
-                    <Button Name="CopyBtn" Grid.Column="1" Content="Copy IP" Width="85" Margin="8,0,0,0" Background="#0284C7" Foreground="White" FontWeight="Bold" BorderThickness="0"/>
-                </Grid>
-            </StackPanel>
-        </Border>
-
-        <StackPanel Grid.Row="2" Margin="0,14,0,0">
-            <TextBlock Text="• Host PC: {host_name}" Foreground="#CBD5E1" FontSize="12" Margin="0,0,0,4"/>
-            <TextBlock Text="• Stream Port: 8765 TCP | Discovery: 8766 UDP" Foreground="#CBD5E1" FontSize="12" Margin="0,0,0,4"/>
-            <TextBlock Text="• Windows Firewall: Configured &amp; Active" Foreground="#4ADE80" FontSize="12"/>
-        </StackPanel>
-
-        <Border Grid.Row="3" Background="#0F172A" Margin="0,12,0,0" Padding="10" CornerRadius="8" BorderBrush="#1E293B" BorderThickness="1">
-            <TextBlock Text="On your Android phone, tap 'Auto-Detect PC' or type the IP address above to connect instantly." Foreground="#94A3B8" FontSize="11" TextWrapping="Wrap"/>
-        </Border>
-
-        <TextBlock Grid.Row="4" Text="You can minimize this window to keep the server running in background." Foreground="#64748B" FontSize="10" HorizontalAlignment="Center" Margin="0,10,0,0"/>
-    </Grid>
-</Window>"#,
-        full_ip = full_ip,
-        host_name = host_name
-    );
-
-    let script = format!(
-        r#"[void][System.Reflection.Assembly]::LoadWithPartialName('presentationframework');
-$xaml = @'
-{xaml}
-'@
-$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml));
-$window = [System.Windows.Markup.XamlReader]::Load($reader);
-$copyBtn = $window.FindName('CopyBtn');
-$ipBox = $window.FindName('IpBox');
-$copyBtn.Add_Click({{
-    [System.Windows.Clipboard]::SetText($ipBox.Text);
-    $copyBtn.Content = 'Copied!';
-}});
-$window.ShowDialog() | Out-Null;"#,
-        xaml = xaml
-    );
+    let local_ip = local_ip.to_string();
+    let host_name = host_name.to_string();
 
     std::thread::spawn(move || {
+        let ps_code = r###"
+Add-Type -AssemblyName PresentationFramework, System.Windows.Forms
+$ip = $args[0]
+$fullIp = "$ip:8765"
+$pcName = $args[1]
+
+$win = New-Object System.Windows.Window
+$win.Title = "Remote PC Controller - Host Server"
+$win.Width = 470
+$win.Height = 360
+$win.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen
+$win.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#0F172A")
+$win.ResizeMode = [System.Windows.ResizeMode]::CanMinimize
+
+$grid = New-Object System.Windows.Controls.Grid
+$grid.Margin = New-Object System.Windows.Thickness(20)
+
+for ($i = 0; $i -lt 5; $i++) {
+    $rd = New-Object System.Windows.Controls.RowDefinition
+    if ($i -eq 3) { $rd.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star) }
+    else { $rd.Height = [System.Windows.GridLength]::Auto }
+    $grid.RowDefinitions.Add($rd)
+}
+
+# Row 0: Status Header
+$sp0 = New-Object System.Windows.Controls.StackPanel
+$sp0.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+$sp0.Margin = New-Object System.Windows.Thickness(0, 0, 0, 16)
+[System.Windows.Controls.Grid]::SetRow($sp0, 0)
+
+$dot = New-Object System.Windows.Controls.Border
+$dot.Width = 12; $dot.Height = 12; $dot.CornerRadius = New-Object System.Windows.CornerRadius(6)
+$dot.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#22C55E")
+$dot.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+$dot.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+$sp0.Children.Add($dot) | Out-Null
+
+$title = New-Object System.Windows.Controls.TextBlock
+$title.Text = "Server Running & Mirroring Active"
+$title.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F8FAFC")
+$title.FontSize = 15; $title.FontWeight = [System.Windows.FontWeights]::Bold
+$title.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+$sp0.Children.Add($title) | Out-Null
+$grid.Children.Add($sp0) | Out-Null
+
+# Row 1: IP Box Card
+$b1 = New-Object System.Windows.Controls.Border
+$b1.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1E293B")
+$b1.CornerRadius = New-Object System.Windows.CornerRadius(10)
+$b1.Padding = New-Object System.Windows.Thickness(14)
+$b1.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#334155")
+$b1.BorderThickness = New-Object System.Windows.Thickness(1)
+[System.Windows.Controls.Grid]::SetRow($b1, 1)
+
+$sp1 = New-Object System.Windows.Controls.StackPanel
+$lbl = New-Object System.Windows.Controls.TextBlock
+$lbl.Text = "YOUR PC LOCAL IP ADDRESS (ENTER IN PHONE APP):"
+$lbl.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#94A3B8")
+$lbl.FontSize = 11; $lbl.FontWeight = [System.Windows.FontWeights]::Bold
+$lbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+$sp1.Children.Add($lbl) | Out-Null
+
+$gIp = New-Object System.Windows.Controls.Grid
+$col0 = New-Object System.Windows.Controls.ColumnDefinition
+$col0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+$col1 = New-Object System.Windows.Controls.ColumnDefinition
+$col1.Width = [System.Windows.GridLength]::Auto
+$gIp.ColumnDefinitions.Add($col0)
+$gIp.ColumnDefinitions.Add($col1)
+
+$txtIp = New-Object System.Windows.Controls.TextBox
+$txtIp.Text = $fullIp
+$txtIp.IsReadOnly = $true
+$txtIp.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#0F172A")
+$txtIp.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#38BDF8")
+$txtIp.FontSize = 18; $txtIp.FontWeight = [System.Windows.FontWeights]::Bold
+$txtIp.Padding = New-Object System.Windows.Thickness(8, 4, 8, 4)
+$txtIp.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#38BDF8")
+[System.Windows.Controls.Grid]::SetColumn($txtIp, 0)
+$gIp.Children.Add($txtIp) | Out-Null
+
+$btnCopy = New-Object System.Windows.Controls.Button
+$btnCopy.Content = "Copy IP"
+$btnCopy.Width = 85
+$btnCopy.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+$btnCopy.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#0284C7")
+$btnCopy.Foreground = [System.Windows.Media.Brushes]::White
+$btnCopy.FontWeight = [System.Windows.FontWeights]::Bold
+$btnCopy.BorderThickness = New-Object System.Windows.Thickness(0)
+$btnCopy.Add_Click({
+    [System.Windows.Forms.Clipboard]::SetText($txtIp.Text)
+    $btnCopy.Content = "Copied!"
+})
+[System.Windows.Controls.Grid]::SetColumn($btnCopy, 1)
+$gIp.Children.Add($btnCopy) | Out-Null
+$sp1.Children.Add($gIp) | Out-Null
+$b1.Child = $sp1
+$grid.Children.Add($b1) | Out-Null
+
+# Row 2: Status Details
+$sp2 = New-Object System.Windows.Controls.StackPanel
+$sp2.Margin = New-Object System.Windows.Thickness(0, 14, 0, 0)
+[System.Windows.Controls.Grid]::SetRow($sp2, 2)
+
+$t1 = New-Object System.Windows.Controls.TextBlock
+$t1.Text = ". Host PC: " + $pcName
+$t1.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
+$t1.FontSize = 12; $t1.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
+$sp2.Children.Add($t1) | Out-Null
+
+$t2 = New-Object System.Windows.Controls.TextBlock
+$t2.Text = ". Stream Port: 8765 TCP | Discovery: 8766 UDP"
+$t2.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
+$t2.FontSize = 12; $t2.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
+$sp2.Children.Add($t2) | Out-Null
+
+$t3 = New-Object System.Windows.Controls.TextBlock
+$t3.Text = ". Windows Firewall: Configured & Active"
+$t3.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4ADE80")
+$t3.FontSize = 12
+$sp2.Children.Add($t3) | Out-Null
+$grid.Children.Add($sp2) | Out-Null
+
+# Row 3: Instructions
+$b3 = New-Object System.Windows.Controls.Border
+$b3.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#0F172A")
+$b3.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
+$b3.Padding = New-Object System.Windows.Thickness(10)
+$b3.CornerRadius = New-Object System.Windows.CornerRadius(8)
+$b3.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1E293B")
+$b3.BorderThickness = New-Object System.Windows.Thickness(1)
+[System.Windows.Controls.Grid]::SetRow($b3, 3)
+
+$tInst = New-Object System.Windows.Controls.TextBlock
+$tInst.Text = "On your Android phone, tap Auto-Detect PC or type the IP address above to connect instantly."
+$tInst.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#94A3B8")
+$tInst.FontSize = 11; $tInst.TextWrapping = [System.Windows.TextWrapping]::Wrap
+$b3.Child = $tInst
+$grid.Children.Add($b3) | Out-Null
+
+# Row 4: Footer
+$foot = New-Object System.Windows.Controls.TextBlock
+$foot.Text = "You can minimize this window to keep the server running in background."
+$foot.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#64748B")
+$foot.FontSize = 10; $foot.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+$foot.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+[System.Windows.Controls.Grid]::SetRow($foot, 4)
+$grid.Children.Add($foot) | Out-Null
+
+$win.Content = $grid
+$win.ShowDialog() | Out-Null
+"###;
+
         let _ = Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_code, &local_ip, &host_name])
             .output();
     });
 }

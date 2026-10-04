@@ -134,6 +134,82 @@ fn get_local_lan_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+/// Spawns a native Windows GUI window displaying the PC's IP and connection status
+fn spawn_gui_window(local_ip: &str, host_name: &str) {
+    let full_ip = format!("{}:8765", local_ip);
+    let xaml = format!(
+        r#"<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="Remote PC Controller - Host Server" Height="360" Width="470"
+        WindowStartupLocation="CenterScreen" Background="#0F172A" ResizeMode="CanMinimize">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,16">
+            <Border Width="12" Height="12" CornerRadius="6" Background="#22C55E" Margin="0,0,10,0" VerticalAlignment="Center"/>
+            <TextBlock Text="Server Running &amp; Mirroring Active" Foreground="#F8FAFC" FontSize="15" FontWeight="Bold" VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Background="#1E293B" CornerRadius="10" Padding="14" BorderBrush="#334155" BorderThickness="1">
+            <StackPanel>
+                <TextBlock Text="YOUR PC LOCAL IP ADDRESS (ENTER IN PHONE APP):" Foreground="#94A3B8" FontSize="11" FontWeight="Bold" Margin="0,0,0,6"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox Name="IpBox" Grid.Column="0" Text="{full_ip}" IsReadOnly="True" Background="#0F172A" Foreground="#38BDF8" FontSize="18" FontWeight="Bold" Padding="8,4" BorderBrush="#38BDF8" BorderThickness="1"/>
+                    <Button Name="CopyBtn" Grid.Column="1" Content="Copy IP" Width="85" Margin="8,0,0,0" Background="#0284C7" Foreground="White" FontWeight="Bold" BorderThickness="0"/>
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="2" Margin="0,14,0,0">
+            <TextBlock Text="• Host PC: {host_name}" Foreground="#CBD5E1" FontSize="12" Margin="0,0,0,4"/>
+            <TextBlock Text="• Stream Port: 8765 TCP | Discovery: 8766 UDP" Foreground="#CBD5E1" FontSize="12" Margin="0,0,0,4"/>
+            <TextBlock Text="• Windows Firewall: Configured &amp; Active" Foreground="#4ADE80" FontSize="12"/>
+        </StackPanel>
+
+        <Border Grid.Row="3" Background="#0F172A" Margin="0,12,0,0" Padding="10" CornerRadius="8" BorderBrush="#1E293B" BorderThickness="1">
+            <TextBlock Text="On your Android phone, tap 'Auto-Detect PC' or type the IP address above to connect instantly." Foreground="#94A3B8" FontSize="11" TextWrapping="Wrap"/>
+        </Border>
+
+        <TextBlock Grid.Row="4" Text="You can minimize this window to keep the server running in background." Foreground="#64748B" FontSize="10" HorizontalAlignment="Center" Margin="0,10,0,0"/>
+    </Grid>
+</Window>"#,
+        full_ip = full_ip,
+        host_name = host_name
+    );
+
+    let script = format!(
+        r#"[void][System.Reflection.Assembly]::LoadWithPartialName('presentationframework');
+$xaml = @'
+{xaml}
+'@
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml));
+$window = [System.Windows.Markup.XamlReader]::Load($reader);
+$copyBtn = $window.FindName('CopyBtn');
+$ipBox = $window.FindName('IpBox');
+$copyBtn.Add_Click({{
+    [System.Windows.Clipboard]::SetText($ipBox.Text);
+    $copyBtn.Content = 'Copied!';
+}});
+$window.ShowDialog() | Out-Null;"#,
+        xaml = xaml
+    );
+
+    std::thread::spawn(move || {
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .output();
+    });
+}
+
 /// Start UDP discovery beacon on port 8766 so mobile app discovers PC automatically
 fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
     std::thread::spawn(move || {
@@ -182,6 +258,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 4. Start UDP Discovery Beacon so mobile app discovers PC with 1 click
     start_udp_discovery_beacon(local_lan_ip.clone(), host_name.clone());
+
+    // 5. Open sleek native Windows GUI Window with IP & Copy button
+    spawn_gui_window(&local_lan_ip, &host_name);
 
     println!("------------------------------------------------------------");
     println!("  [+] PC NAME:              {}", host_name);

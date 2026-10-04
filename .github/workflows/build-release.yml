@@ -64,22 +64,18 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Ensure Android Project Scaffolding & Permissions
+      - name: Scaffold Complete Android Project with Modern V2 Embedding
         working-directory: client_mobile
         run: |
-          if [ ! -d "android/app/src/main" ]; then
-            echo "Generating Android platform scaffolding..."
-            flutter create . --platforms=android --org com.remotepc
-          fi
-
+          rm -rf android
+          flutter create . --platforms=android --org com.remotepc
+          
+          # Inject INTERNET and multicast permissions into generated AndroidManifest.xml
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
-            if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
-              echo "Injecting network permissions into $MANIFEST..."
-              sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>' "$MANIFEST"
-            fi
-            echo "Verified AndroidManifest.xml:"
-            cat "$MANIFEST" | head -n 15
+            sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>' "$MANIFEST"
+            echo "Successfully updated $MANIFEST with network permissions:"
+            head -n 20 "$MANIFEST"
           fi
           flutter pub get
 

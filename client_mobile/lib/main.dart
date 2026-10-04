@@ -163,8 +163,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       if (mounted) {
         setState(() {
           _isScanning = false;
-          _statusMessage = 'Scan error: $e';
+          _statusMessage = 'Auto-detect unavailable. Enter PC IP from host window and tap Connect.';
         });
+        _showToast('Enter PC IP directly from your PC host window');
       }
     }
   }

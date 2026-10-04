@@ -50,6 +50,24 @@ class RemotePcApp extends StatelessWidget {
   }
 }
 
+class WebShortcutItem {
+  final String name;
+  final String url;
+  final IconData icon;
+
+  const WebShortcutItem({required this.name, required this.url, required this.icon});
+
+  Map<String, dynamic> toJson() => {'name': name, 'url': url};
+
+  factory WebShortcutItem.fromJson(Map<String, dynamic> json) {
+    return WebShortcutItem(
+      name: json['name'] ?? '',
+      url: json['url'] ?? '',
+      icon: Icons.language,
+    );
+  }
+}
+
 class RemoteControllerScreen extends StatefulWidget {
   const RemoteControllerScreen({super.key});
 
@@ -61,6 +79,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   final TextEditingController _ipController =
       TextEditingController(text: '192.168.1.100:8765');
   final TextEditingController _textController = TextEditingController();
+  final TextEditingController _customAppController = TextEditingController();
   final FocusNode _textFocusNode = FocusNode();
   final GlobalKey _viewportKey = GlobalKey();
 
@@ -83,11 +102,28 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   double _remoteHeight = 1080;
   String _hostPcName = '';
 
+  // Control Mode: Direct Touch (like a touchscreen) vs Trackpad (laptop touchpad)
+  bool _isDirectTouchMode = true;
+  bool _isDragLocked = false;
+  double _trackpadSensitivity = 1.35;
+
+  // Custom Websites & Shortcuts
+  final List<WebShortcutItem> _webShortcuts = [
+    const WebShortcutItem(name: 'YouTube', url: 'https://youtube.com', icon: Icons.play_circle_fill),
+    const WebShortcutItem(name: 'Google', url: 'https://google.com', icon: Icons.search),
+    const WebShortcutItem(name: 'ChatGPT', url: 'https://chatgpt.com', icon: Icons.smart_toy),
+    const WebShortcutItem(name: 'Netflix', url: 'https://netflix.com', icon: Icons.movie),
+    const WebShortcutItem(name: 'Twitch', url: 'https://twitch.tv', icon: Icons.live_tv),
+    const WebShortcutItem(name: 'Reddit', url: 'https://reddit.com', icon: Icons.forum),
+    const WebShortcutItem(name: 'GitHub', url: 'https://github.com', icon: Icons.code),
+  ];
+
   @override
   void dispose() {
     _disconnect();
     _ipController.dispose();
     _textController.dispose();
+    _customAppController.dispose();
     _textFocusNode.dispose();
     super.dispose();
   }
@@ -108,14 +144,12 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       socket.broadcastEnabled = true;
 
-      // Listen for UDP response from Windows PC host
       socket.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
           final datagram = socket?.receive();
           if (datagram != null) {
             final reply = utf8.decode(datagram.data);
             if (reply.startsWith('REMOTE_PC_HOST:')) {
-              // Expected format: REMOTE_PC_HOST:<HOSTNAME>:<IP>:8765
               final parts = reply.split(':');
               if (parts.length >= 4) {
                 final hostName = parts[1];
@@ -134,7 +168,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     _statusMessage = 'Found $hostName ($fullAddress)! Connecting...';
                   });
                   _showToast('Found $hostName ($fullAddress)');
-                  // Automatically connect once found!
                   _connect();
                 }
               }
@@ -143,11 +176,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         }
       });
 
-      // Send discovery broadcast beacon to port 8766
       final pingBytes = utf8.encode('DISCOVER_REMOTE_PC');
       socket.send(pingBytes, InternetAddress('255.255.255.255'), 8766);
 
-      // Stop scanning after 3.5 seconds if no response
       timeoutTimer = Timer(const Duration(milliseconds: 3500), () {
         socket?.close();
         if (mounted && _isScanning) {
@@ -315,13 +346,13 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     } catch (_) {}
   }
 
-  void _handleTouch(Offset localPosition, {bool isClick = false, String button = 'left'}) {
+  Offset? _getNormalizedCoordinates(Offset localPosition) {
     final RenderBox? box =
         _viewportKey.currentContext?.findRenderObject() as RenderBox?;
-    if (box == null) return;
+    if (box == null) return null;
 
     final Size widgetSize = box.size;
-    if (widgetSize.width <= 0 || widgetSize.height <= 0) return;
+    if (widgetSize.width <= 0 || widgetSize.height <= 0) return null;
 
     final double hostAspect = _remoteWidth / _remoteHeight;
     final double viewAspect = widgetSize.width / widgetSize.height;
@@ -348,23 +379,68 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         touchInsideX > renderedWidth ||
         touchInsideY < 0 ||
         touchInsideY > renderedHeight) {
-      return;
+      return null;
     }
 
-    final double normalizedX = (touchInsideX / renderedWidth).clamp(0.0, 1.0);
-    final double normalizedY = (touchInsideY / renderedHeight).clamp(0.0, 1.0);
+    return Offset(
+      (touchInsideX / renderedWidth).clamp(0.0, 1.0),
+      (touchInsideY / renderedHeight).clamp(0.0, 1.0),
+    );
+  }
 
-    _sendJson({
-      'type': 'move',
-      'x': normalizedX,
-      'y': normalizedY,
-    });
+  void _handleDirectTouchTap(Offset localPosition) {
+    final coords = _getNormalizedCoordinates(localPosition);
+    if (coords == null) return;
 
-    if (isClick) {
-      _sendJson({
-        'type': 'click',
-        'button': button,
-      });
+    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+    _sendJson({'type': 'click', 'button': 'left'});
+  }
+
+  void _handleDirectTouchDoubleTap(Offset localPosition) {
+    final coords = _getNormalizedCoordinates(localPosition);
+    if (coords == null) return;
+
+    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+    _sendJson({'type': 'double_click', 'button': 'left'});
+  }
+
+  void _handleDirectTouchLongPress(Offset localPosition) {
+    final coords = _getNormalizedCoordinates(localPosition);
+    if (coords == null) return;
+
+    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+    _sendJson({'type': 'click', 'button': 'right'});
+    HapticFeedback.mediumImpact();
+    _showToast('Right clicked');
+  }
+
+  void _handleDirectTouchPanStart(DragStartDetails details) {
+    final coords = _getNormalizedCoordinates(details.localPosition);
+    if (coords == null) return;
+
+    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+    if (_isDragLocked) {
+      _sendJson({'type': 'mouse_down', 'button': 'left'});
+    }
+  }
+
+  void _handleDirectTouchPanUpdate(DragUpdateDetails details) {
+    if (_isDirectTouchMode) {
+      final coords = _getNormalizedCoordinates(details.localPosition);
+      if (coords != null) {
+        _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+      }
+    } else {
+      // Trackpad relative movement
+      final dx = details.delta.dx * _trackpadSensitivity;
+      final dy = details.delta.dy * _trackpadSensitivity;
+      _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
+    }
+  }
+
+  void _handleDirectTouchPanEnd(DragEndDetails details) {
+    if (_isDirectTouchMode && _isDragLocked) {
+      _sendJson({'type': 'mouse_up', 'button': 'left'});
     }
   }
 
@@ -372,19 +448,253 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     final text = _textController.text;
     if (text.isEmpty) return;
 
-    _sendJson({
-      'type': 'type',
-      'text': text,
-    });
-
+    _sendJson({'type': 'type', 'text': text});
     _textController.clear();
   }
 
   void _sendKey(String key) {
-    _sendJson({
-      'type': 'key',
-      'key': key,
-    });
+    _sendJson({'type': 'key', 'key': key});
+    if (key == 'win') {
+      _showToast('Toggled Windows Start Menu');
+    }
+  }
+
+  void _openWebUrl(String url) {
+    _sendJson({'type': 'open_url', 'url': url});
+    _showToast('Opening $url on PC');
+  }
+
+  void _launchApp(String app) {
+    if (app.trim().isEmpty) return;
+    _sendJson({'type': 'launch_app', 'app': app.trim()});
+    _showToast('Launching $app on PC');
+  }
+
+  void _showAddShortcutDialog() {
+    final nameCtrl = TextEditingController();
+    final urlCtrl = TextEditingController(text: 'https://');
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text('Add Custom Website Shortcut', style: TextStyle(color: Colors.white, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              autofocus: true,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(labelText: 'Shortcut Name (e.g. My Anime Site, Work Jira)'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: urlCtrl,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(labelText: 'Website URL (e.g. https://...)'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              final url = urlCtrl.text.trim();
+              if (name.isNotEmpty && url.isNotEmpty) {
+                setState(() {
+                  _webShortcuts.add(WebShortcutItem(name: name, url: url, icon: Icons.bookmark));
+                });
+                Navigator.pop(ctx);
+                _showToast('Added shortcut: $name');
+              }
+            },
+            child: const Text('Add', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showShortcutsAndAppsSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0F172A),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => DefaultTabController(
+        length: 2,
+        child: Container(
+          height: MediaQuery.of(context).size.height * 0.7,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Column(
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(color: const Color(0xFF475569), borderRadius: BorderRadius.circular(2)),
+              ),
+              const SizedBox(height: 12),
+              const TabBar(
+                indicatorColor: Color(0xFF38BDF8),
+                labelColor: Color(0xFF38BDF8),
+                unselectedLabelColor: Color(0xFF94A3B8),
+                tabs: [
+                  Tab(icon: Icon(Icons.language), text: 'Websites & Shortcuts'),
+                  Tab(icon: Icon(Icons.apps), text: 'PC & Desktop Apps'),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: TabBarView(
+                  children: [
+                    // Tab 1: Websites & Custom Shortcuts
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('QUICK WEB SHORTCUTS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                            TextButton.icon(
+                              onPressed: _showAddShortcutDialog,
+                              icon: const Icon(Icons.add, size: 16, color: Color(0xFF38BDF8)),
+                              label: const Text('Add Custom Site', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 12)),
+                            ),
+                          ],
+                        ),
+                        Expanded(
+                          child: GridView.builder(
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              childAspectRatio: 2.2,
+                              crossAxisSpacing: 8,
+                              mainAxisSpacing: 8,
+                            ),
+                            itemCount: _webShortcuts.length,
+                            itemBuilder: (context, index) {
+                              final item = _webShortcuts[index];
+                              return InkWell(
+                                onTap: () {
+                                  Navigator.pop(ctx);
+                                  _openWebUrl(item.url);
+                                },
+                                borderRadius: BorderRadius.circular(8),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1E293B),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: const Color(0xFF334155)),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Icon(item.icon, size: 20, color: const Color(0xFF38BDF8)),
+                                      const SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          item.name,
+                                          style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    // Tab 2: Apps & Desktop Launcher
+                    SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('LAUNCH ANY APP OR DESKTOP SHORTCUT', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: _customAppController,
+                                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                                  decoration: const InputDecoration(
+                                    hintText: 'e.g. chrome, steam, discord, calc, notepad',
+                                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              ElevatedButton(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF0284C7),
+                                  foregroundColor: Colors.white,
+                                ),
+                                onPressed: () {
+                                  Navigator.pop(ctx);
+                                  _launchApp(_customAppController.text);
+                                },
+                                child: const Text('Launch'),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          const Text('POPULAR PC APPLICATIONS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              _buildAppLaunchChip(ctx, 'File Explorer', 'explorer', Icons.folder),
+                              _buildAppLaunchChip(ctx, 'Desktop Folder', 'explorer shell:Desktop', Icons.desktop_windows),
+                              _buildAppLaunchChip(ctx, 'Task Manager', 'taskmgr', Icons.analytics),
+                              _buildAppLaunchChip(ctx, 'Chrome', 'chrome', Icons.public),
+                              _buildAppLaunchChip(ctx, 'Command Prompt', 'cmd', Icons.terminal),
+                              _buildAppLaunchChip(ctx, 'PowerShell', 'powershell', Icons.code),
+                              _buildAppLaunchChip(ctx, 'Notepad', 'notepad', Icons.description),
+                              _buildAppLaunchChip(ctx, 'Calculator', 'calc', Icons.calculate),
+                              _buildAppLaunchChip(ctx, 'Settings', 'ms-settings:', Icons.settings),
+                              _buildAppLaunchChip(ctx, 'Steam', 'steam', Icons.sports_esports),
+                              _buildAppLaunchChip(ctx, 'Spotify', 'spotify', Icons.music_note),
+                              _buildAppLaunchChip(ctx, 'Discord', 'discord', Icons.chat),
+                              _buildAppLaunchChip(ctx, 'VS Code', 'code', Icons.integration_instructions),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAppLaunchChip(BuildContext ctx, String label, String cmd, IconData icon) {
+    return ActionChip(
+      backgroundColor: const Color(0xFF1E293B),
+      side: const BorderSide(color: Color(0xFF334155)),
+      avatar: Icon(icon, size: 16, color: const Color(0xFF38BDF8)),
+      label: Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
+      onPressed: () {
+        Navigator.pop(ctx);
+        _launchApp(cmd);
+      },
+    );
   }
 
   void _showToast(String msg) {
@@ -404,6 +714,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           children: [
             _buildHeader(),
             Expanded(child: _buildScreenViewport()),
+            _buildQuickMouseControlBar(),
             _buildActionBar(),
           ],
         ),
@@ -420,7 +731,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       ),
       child: Row(
         children: [
-          // Connection status dot
+          // Connection status indicator
           Container(
             width: 10,
             height: 10,
@@ -435,7 +746,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           ),
           const SizedBox(width: 8),
 
-          // 1-Click Auto-Detect PC Button (No typing needed!)
+          // 1-Click Auto-Detect PC Button
           if (!_isConnected)
             Padding(
               padding: const EdgeInsets.only(right: 6.0),
@@ -451,29 +762,30 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                   ),
                   icon: _isScanning
                       ? const SizedBox(
-                          width: 12,
-                          height: 12,
+                          width: 14,
+                          height: 14,
                           child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF38BDF8)),
                         )
                       : const Icon(Icons.wifi_find, size: 16),
-                  label: Text(_isScanning ? 'Scanning...' : 'Auto-Detect PC',
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                  label: Text(_isScanning ? 'Scanning...' : 'Auto-Detect PC', style: const TextStyle(fontSize: 12)),
                 ),
               ),
             ),
 
-          // Host IP / Port Input
+          // Target IP TextField
           Expanded(
             child: SizedBox(
               height: 38,
               child: TextField(
                 controller: _ipController,
-                enabled: !_isConnected && !_isConnecting && !_isScanning,
+                enabled: !_isConnected && !_isConnecting,
                 style: const TextStyle(fontSize: 13, color: Colors.white),
-                decoration: const InputDecoration(
-                  hintText: '192.168.1.100:8765',
-                  contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
-                  prefixIcon: Icon(Icons.computer, size: 16, color: Color(0xFF94A3B8)),
+                decoration: InputDecoration(
+                  hintText: 'IP:Port (e.g. 192.168.1.45:8765)',
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                  suffixIcon: _isConnected
+                      ? const Icon(Icons.lock_open, size: 16, color: Color(0xFF22C55E))
+                      : null,
                 ),
               ),
             ),
@@ -484,47 +796,27 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           SizedBox(
             height: 38,
             child: ElevatedButton(
-              onPressed: _isConnecting || _isScanning
+              onPressed: _isConnecting
                   ? null
                   : (_isConnected ? _disconnect : _connect),
               style: ElevatedButton.styleFrom(
-                backgroundColor: _isConnected ? const Color(0xFFDC2626) : const Color(0xFF0284C7),
+                backgroundColor: _isConnected
+                    ? const Color(0xFFDC2626)
+                    : const Color(0xFF0284C7),
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 14),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
-              child: Text(
-                _isConnected ? 'Disconnect' : 'Connect',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
+              child: Text(_isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 12)),
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
 
-          // Latency & FPS indicators
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                '${_latencyMs}ms',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  color: _latencyMs < 50
-                      ? const Color(0xFF22C55E)
-                      : (_latencyMs < 120 ? const Color(0xFFEAB308) : const Color(0xFFEF4444)),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '${_renderedFps}fps',
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  color: Color(0xFF38BDF8),
-                ),
-              ),
-            ],
+          // Shortcuts & Apps Sheet Trigger
+          IconButton(
+            onPressed: _showShortcutsAndAppsSheet,
+            icon: const Icon(Icons.rocket_launch, color: Color(0xFF38BDF8)),
+            tooltip: 'Websites & Apps Launcher',
           ),
         ],
       ),
@@ -535,18 +827,34 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     return Container(
       key: _viewportKey,
       color: Colors.black,
-      width: double.infinity,
-      height: double.infinity,
-      child: _isConnected && _latestFrameBytes != null
+      child: _latestFrameBytes != null
           ? GestureDetector(
-              onTapDown: (details) =>
-                  _handleTouch(details.localPosition, isClick: true, button: 'left'),
-              onSecondaryTapDown: (details) =>
-                  _handleTouch(details.localPosition, isClick: true, button: 'right'),
-              onLongPressStart: (details) =>
-                  _handleTouch(details.localPosition, isClick: true, button: 'right'),
-              onPanUpdate: (details) =>
-                  _handleTouch(details.localPosition, isClick: false),
+              behavior: HitTestBehavior.opaque,
+              // Direct Touch Screen Handlers
+              onTapDown: (details) {
+                if (_isDirectTouchMode) {
+                  _handleDirectTouchTap(details.localPosition);
+                } else {
+                  _sendJson({'type': 'click', 'button': 'left'});
+                }
+              },
+              onDoubleTapDown: (details) {
+                if (_isDirectTouchMode) {
+                  _handleDirectTouchDoubleTap(details.localPosition);
+                } else {
+                  _sendJson({'type': 'double_click', 'button': 'left'});
+                }
+              },
+              onLongPressStart: (details) {
+                if (_isDirectTouchMode) {
+                  _handleDirectTouchLongPress(details.localPosition);
+                } else {
+                  _sendJson({'type': 'click', 'button': 'right'});
+                }
+              },
+              onPanStart: _handleDirectTouchPanStart,
+              onPanUpdate: _handleDirectTouchPanUpdate,
+              onPanEnd: _handleDirectTouchPanEnd,
               child: Center(
                 child: AspectRatio(
                   aspectRatio: _remoteWidth / _remoteHeight,
@@ -593,6 +901,100 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
+  /// Toolbar for switching between Touch Screen and Trackpad Mouse Modes, with mouse buttons
+  Widget _buildQuickMouseControlBar() {
+    return Container(
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Row(
+        children: [
+          // Mode Toggle: Touch Screen vs Trackpad
+          Container(
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E293B),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFF334155)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                InkWell(
+                  onTap: () => setState(() => _isDirectTouchMode = true),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: _isDirectTouchMode ? const Color(0xFF0284C7) : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      children: const [
+                        Icon(Icons.touch_app, size: 14, color: Colors.white),
+                        SizedBox(width: 4),
+                        Text('Touch Screen', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ],
+                    ),
+                  ),
+                ),
+                InkWell(
+                  onTap: () => setState(() => _isDirectTouchMode = false),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: !_isDirectTouchMode ? const Color(0xFF0284C7) : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      children: const [
+                        Icon(Icons.mouse, size: 14, color: Colors.white),
+                        SizedBox(width: 4),
+                        Text('Trackpad', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Spacer(),
+
+          // Mouse Action Buttons
+          _buildQuickActionButton('Left Click', Icons.mouse, () => _sendJson({'type': 'click', 'button': 'left'})),
+          const SizedBox(width: 6),
+          _buildQuickActionButton('Right Click', Icons.mouse_outlined, () => _sendJson({'type': 'click', 'button': 'right'})),
+          const SizedBox(width: 6),
+          _buildQuickActionButton('Double', Icons.filter_2, () => _sendJson({'type': 'double_click', 'button': 'left'})),
+          const SizedBox(width: 6),
+          _buildQuickActionButton('Scroll ▲', Icons.arrow_upward, () => _sendJson({'type': 'scroll', 'dy': -3})),
+          const SizedBox(width: 6),
+          _buildQuickActionButton('Scroll ▼', Icons.arrow_downward, () => _sendJson({'type': 'scroll', 'dy': 3})),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickActionButton(String label, IconData icon, VoidCallback onPressed) {
+    return InkWell(
+      onTap: _isConnected ? onPressed : null,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E293B),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFF334155)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 13, color: const Color(0xFF38BDF8)),
+            const SizedBox(width: 4),
+            Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildActionBar() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 8.0),
@@ -615,7 +1017,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     onSubmitted: (_) => _sendTypingText(),
                     style: const TextStyle(fontSize: 13, color: Colors.white),
                     decoration: const InputDecoration(
-                      hintText: 'Type text to send to host...',
+                      hintText: 'Type text to send to PC...',
                       contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
                     ),
                   ),
@@ -642,19 +1044,42 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
+                // Prominent Windows Start Menu Key (Fixed!)
+                ElevatedButton.icon(
+                  onPressed: _isConnected ? () => _sendKey('win') : null,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0284C7),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                  ),
+                  icon: const Icon(Icons.window, size: 16),
+                  label: const Text('Win (Start)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(width: 6),
+                _buildKeyButton('Win+D (Desktop)', 'desktop', Icons.desktop_windows),
+                const SizedBox(width: 6),
+                _buildKeyButton('TaskMgr', 'taskmgr', Icons.analytics_outlined),
+                const SizedBox(width: 6),
+                _buildKeyButton('Alt+Tab', 'alt+tab', Icons.switch_access_shortcut),
+                const SizedBox(width: 6),
                 _buildKeyButton('Enter', 'enter', Icons.keyboard_return),
                 const SizedBox(width: 6),
                 _buildKeyButton('Backspace', 'backspace', Icons.backspace_outlined),
                 const SizedBox(width: 6),
-                _buildKeyButton('Escape', 'escape', Icons.close),
-                const SizedBox(width: 6),
-                _buildKeyButton('Space', 'space', Icons.space_bar),
+                _buildKeyButton('Esc', 'escape', Icons.close),
                 const SizedBox(width: 6),
                 _buildKeyButton('Tab', 'tab', Icons.keyboard_tab),
                 const SizedBox(width: 6),
-                _buildKeyButton('Win', 'win', Icons.window),
+                _buildKeyButton('Space', 'space', Icons.space_bar),
                 const SizedBox(width: 6),
-                _buildClickButton('Right Click', 'right', Icons.mouse),
+                _buildKeyButton('Copy', 'ctrl+c', Icons.copy),
+                const SizedBox(width: 6),
+                _buildKeyButton('Paste', 'ctrl+v', Icons.paste),
+                const SizedBox(width: 6),
+                _buildKeyButton('Undo', 'ctrl+z', Icons.undo),
               ],
             ),
           ),
@@ -669,22 +1094,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       style: OutlinedButton.styleFrom(
         foregroundColor: Colors.white70,
         side: const BorderSide(color: Color(0xFF475569)),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        minimumSize: Size.zero,
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-      ),
-      icon: Icon(icon, size: 14),
-      label: Text(label, style: const TextStyle(fontSize: 12)),
-    );
-  }
-
-  Widget _buildClickButton(String label, String button, IconData icon) {
-    return OutlinedButton.icon(
-      onPressed: _isConnected ? () => _sendJson({'type': 'click', 'button': button}) : null,
-      style: OutlinedButton.styleFrom(
-        foregroundColor: const Color(0xFF38BDF8),
-        side: const BorderSide(color: Color(0xFF0284C7)),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         minimumSize: Size.zero,
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,

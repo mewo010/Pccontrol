@@ -5,8 +5,11 @@
 //! - Auto-Elevation to Administrator (UAC prompt on double-click)
 //! - Auto-Firewall Rule Configuration (Port 8765 TCP & 8766 UDP)
 //! - UDP Auto-Discovery Beacon (Mobile app discovers PC with 1 click, no typing)
-//! - DXGI Desktop Duplication 60 FPS screen capture
-//! - Enigo remote input injection (mouse, keyboard, keys)
+//! - DXGI Desktop Duplication 60 FPS screen capture with instant frame delivery
+//! - Touch screen & Trackpad Mouse Control (absolute & relative movement, click, drag, scroll)
+//! - Windows Key & Keyboard shortcuts (Win / Meta, Alt+Tab, Win+D, TaskMgr)
+//! - Web Shortcut Launcher (opens sites on PC default browser)
+//! - Desktop App Launcher (opens apps & shortcuts on PC)
 
 use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
@@ -16,13 +19,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dxgi_capture_rs::DXGIManager;
-use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ColorType;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Inbound JSON messages sent by the mobile client.
@@ -31,12 +34,26 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 pub enum ClientMessage {
     #[serde(rename = "move")]
     Move { x: f64, y: f64 },
+    #[serde(rename = "move_relative")]
+    MoveRelative { dx: f64, dy: f64 },
+    #[serde(rename = "mouse_down")]
+    MouseDown { button: String },
+    #[serde(rename = "mouse_up")]
+    MouseUp { button: String },
     #[serde(rename = "click")]
     Click { button: String },
+    #[serde(rename = "double_click")]
+    DoubleClick { button: String },
+    #[serde(rename = "scroll")]
+    Scroll { dx: Option<i32>, dy: Option<i32> },
     #[serde(rename = "type")]
     Type { text: String },
     #[serde(rename = "key")]
     Key { key: String },
+    #[serde(rename = "open_url")]
+    OpenUrl { url: String },
+    #[serde(rename = "launch_app")]
+    LaunchApp { app: String },
     #[serde(rename = "ping")]
     Ping { timestamp: Option<u64> },
 }
@@ -74,22 +91,25 @@ fn is_running_as_admin() -> bool {
     }
 }
 
-/// Automatically re-launch process with Administrator UAC prompt if not already elevated
+/// Request UAC elevation by relaunching executable with `runas` verb via PowerShell
 fn relaunch_as_admin() {
     if let Ok(current_exe) = std::env::current_exe() {
-        let exe_path = current_exe.to_string_lossy().to_string();
-        let args = format!("Start-Process -FilePath '{}' -Verb RunAs", exe_path);
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Normal", "-Command", &args])
-            .spawn();
-        std::process::exit(0);
+        if let Some(exe_str) = current_exe.to_str() {
+            let script = format!(
+                "Start-Process -FilePath '{}' -Verb RunAs",
+                exe_str.replace('\'', "''")
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+                .spawn();
+            std::process::exit(0);
+        }
     }
 }
 
 /// Automatically configure Windows Defender Firewall for ports 8765 (TCP) and 8766 (UDP)
 fn setup_windows_firewall() {
     println!("[FIREWALL] Ensuring inbound firewall rules exist for port 8765 TCP & 8766 UDP...");
-    // Add rule for WebSocket TCP streaming port
     let _ = Command::new("netsh")
         .args([
             "advfirewall",
@@ -105,7 +125,6 @@ fn setup_windows_firewall() {
         ])
         .output();
 
-    // Add rule for UDP Auto-Discovery beacon
     let _ = Command::new("netsh")
         .args([
             "advfirewall",
@@ -362,15 +381,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("------------------------------------------------------------");
 
     // Broadcast channel for distributing compressed JPEG frames
-    let (frame_tx, _) = broadcast::channel::<FrameData>(2);
+    let (frame_tx, _) = broadcast::channel::<FrameData>(16);
 
     let screen_width = Arc::new(AtomicUsize::new(1920));
     let screen_height = Arc::new(AtomicUsize::new(1080));
+    let latest_jpeg = Arc::new(RwLock::new(Vec::new()));
 
     // Shared thread-safe input injector
     let enigo = Arc::new(Mutex::new(
         Enigo::new(&Settings::default()).expect("Failed to initialize Enigo input injector"),
     ));
+
+    // Force an initial tiny mouse nudge so DXGI generates a frame immediately on start
+    {
+        if let Ok(mut enigo_init) = Enigo::new(&Settings::default()) {
+            let _ = enigo_init.move_mouse(1, 0, Coordinate::Rel);
+            let _ = enigo_init.move_mouse(-1, 0, Coordinate::Rel);
+        }
+    }
 
     let is_running = Arc::new(AtomicBool::new(true));
 
@@ -379,6 +407,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_running = is_running.clone();
     let width_ref = screen_width.clone();
     let height_ref = screen_height.clone();
+    let capture_latest = latest_jpeg.clone();
 
     std::thread::spawn(move || {
         println!("[DXGI] Initializing Windows DXGI Desktop Duplication API...");
@@ -388,13 +417,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 mgr
             }
             Err(e) => {
-                eprintln!("[DXGI ERROR] Failed to initialize DXGIManager: {:?}. Retrying in 1s...", e);
+                eprintln!("[DXGI] DXGI initialization failed: {:?}. Retrying...", e);
                 std::thread::sleep(Duration::from_secs(1));
                 DXGIManager::new(100).expect("Fatal: Could not initialize DXGI Output Duplication")
             }
         };
 
-        let target_frame_duration = Duration::from_millis(16); // ~60 FPS target
+        let target_frame_duration = Duration::from_millis(16);
         let mut last_valid_jpeg = Arc::new(Vec::new());
 
         while capture_running.load(Ordering::Relaxed) {
@@ -420,7 +449,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         height as u32,
                         ColorType::Rgba8.into(),
                     ) {
-                        last_valid_jpeg = Arc::new(jpeg_buffer);
+                        last_valid_jpeg = Arc::new(jpeg_buffer.clone());
+
+                        // Cache latest frame for instantaneous delivery to new client connections
+                        {
+                            let mut guard = capture_latest.blocking_write();
+                            *guard = jpeg_buffer;
+                        }
+
                         let frame = FrameData {
                             jpeg_bytes: last_valid_jpeg.clone(),
                             width: width as u32,
@@ -430,6 +466,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Err(_) => {
+                    // Screen has not changed (DXGI Timeout) - periodically refresh last frame
                     if !last_valid_jpeg.is_empty() {
                         let frame = FrameData {
                             jpeg_bytes: last_valid_jpeg.clone(),
@@ -454,10 +491,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[NETWORK] WebSocket Server listening on ws://{}", bind_addr);
     println!("[NETWORK] Ready for Android Flutter Client connections...");
 
-    let client_counter = Arc::new(AtomicUsize::new(0));
+    let mut client_counter = 0usize;
 
     while let Ok((stream, addr)) = listener.accept().await {
-        let client_id = client_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        client_counter += 1;
+        let client_id = client_counter;
         println!("[+] Client #{} connected from {}", client_id, addr);
 
         let frame_rx = frame_tx.subscribe();
@@ -466,6 +504,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let height_clone = screen_height.clone();
         let host_name_clone = host_name.clone();
         let ip_clone = local_lan_ip.clone();
+        let latest_jpeg_clone = latest_jpeg.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -478,6 +517,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 height_clone,
                 host_name_clone,
                 ip_clone,
+                latest_jpeg_clone,
             )
             .await
             {
@@ -501,11 +541,12 @@ async fn handle_connection(
     screen_height: Arc<AtomicUsize>,
     host_name: String,
     ip_address: String,
+    latest_jpeg: Arc<RwLock<Vec<u8>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_sink, mut ws_stream_reader) = ws_stream.split();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
 
     // Send screen resolution and host info payload
     let initial_width = screen_width.load(Ordering::Relaxed) as u32;
@@ -521,6 +562,14 @@ async fn handle_connection(
         let _ = out_tx.send(Message::Text(info_json)).await;
     }
 
+    // Immediately deliver the latest frame so client sees the screen without waiting!
+    {
+        let cached = latest_jpeg.read().await;
+        if !cached.is_empty() {
+            let _ = out_tx.send(Message::Binary(cached.clone())).await;
+        }
+    }
+
     // Task A: Write outbound frames and responses to client socket
     let out_tx_ping = out_tx.clone();
     let write_task = tokio::spawn(async move {
@@ -532,11 +581,23 @@ async fn handle_connection(
         }
     });
 
-    // Task B: Forward video frames; drop lagging frames if channel buffer is full
+    // Task B: Forward video frames; gracefully skip lagged frames without terminating loop!
+    let out_tx_frames = out_tx.clone();
     let frame_task = tokio::spawn(async move {
-        while let Ok(frame) = frame_rx.recv().await {
-            let msg = Message::Binary(frame.jpeg_bytes.as_ref().clone());
-            let _ = out_tx.try_send(msg);
+        loop {
+            match frame_rx.recv().await {
+                Ok(frame) => {
+                    let msg = Message::Binary(frame.jpeg_bytes.as_ref().clone());
+                    let _ = out_tx_frames.try_send(msg);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Receiver fell behind: simply continue to receive the newest frame!
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
         }
     });
 
@@ -550,13 +611,35 @@ async fn handle_connection(
                     let cur_h = screen_height.load(Ordering::Relaxed) as f64;
 
                     match cmd {
+                        // Direct Touch Screen / Absolute Mouse Positioning
                         ClientMessage::Move { x, y } => {
-                            let clamped_x = x.clamp(0.0, 1.0);
-                            let clamped_y = y.clamp(0.0, 1.0);
-                            let target_x = (clamped_x * cur_w).round() as i32;
-                            let target_y = (clamped_y * cur_h).round() as i32;
-                            let _ = enigo_guard.move_mouse(target_x, target_y, Coordinate::Abs);
+                            let clamped_x = (x.clamp(0.0, 1.0) * cur_w) as i32;
+                            let clamped_y = (y.clamp(0.0, 1.0) * cur_h) as i32;
+                            let _ = enigo_guard.move_mouse(clamped_x, clamped_y, Coordinate::Abs);
                         }
+                        // Laptop Trackpad / Relative Mouse Movement
+                        ClientMessage::MoveRelative { dx, dy } => {
+                            let _ = enigo_guard.move_mouse(dx as i32, dy as i32, Coordinate::Rel);
+                        }
+                        // Mouse Press / Dragging
+                        ClientMessage::MouseDown { button } => {
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Press);
+                        }
+                        // Mouse Release
+                        ClientMessage::MouseUp { button } => {
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Release);
+                        }
+                        // Mouse Click
                         ClientMessage::Click { button } => {
                             let btn = match button.to_lowercase().as_str() {
                                 "right" => Button::Right,
@@ -565,26 +648,144 @@ async fn handle_connection(
                             };
                             let _ = enigo_guard.button(btn, Direction::Click);
                         }
+                        // Double Click
+                        ClientMessage::DoubleClick { button } => {
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Click);
+                            let _ = enigo_guard.button(btn, Direction::Click);
+                        }
+                        // Mouse Scroll
+                        ClientMessage::Scroll { dx: _, dy } => {
+                            if let Some(y) = dy {
+                                let _ = enigo_guard.scroll(y, Axis::Vertical);
+                            }
+                        }
+                        // Keyboard Text Typing
                         ClientMessage::Type { text } => {
                             let _ = enigo_guard.text(&text);
                         }
+                        // Keyboard Key and Windows Key Actions
                         ClientMessage::Key { key } => {
-                            let target_key = match key.to_lowercase().as_str() {
-                                "enter" | "return" => Some(Key::Return),
-                                "backspace" => Some(Key::Backspace),
-                                "escape" | "esc" => Some(Key::Escape),
-                                "tab" => Some(Key::Tab),
-                                "space" => Some(Key::Space),
-                                "up" => Some(Key::UpArrow),
-                                "down" => Some(Key::DownArrow),
-                                "left" => Some(Key::LeftArrow),
-                                "right" => Some(Key::RightArrow),
-                                _ => None,
-                            };
-                            if let Some(k) = target_key {
-                                let _ = enigo_guard.key(k, Direction::Click);
+                            let lower = key.to_lowercase();
+                            match lower.as_str() {
+                                // Windows Start Menu key (triggers VK_LWIN + Ctrl+Esc for 100% reliability)
+                                "win" | "meta" | "super" | "windows" => {
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Press);
+                                    std::thread::sleep(Duration::from_millis(50));
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Release);
+
+                                    // Fallback Ctrl+Esc triggers Start Menu on all Windows configurations
+                                    let _ = enigo_guard.key(Key::Control, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Escape, Direction::Click);
+                                    let _ = enigo_guard.key(Key::Control, Direction::Release);
+                                }
+                                "win+d" | "desktop" => {
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Unicode('d'), Direction::Click);
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Release);
+                                }
+                                "win+tab" => {
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Tab, Direction::Click);
+                                    let _ = enigo_guard.key(Key::Meta, Direction::Release);
+                                }
+                                "alt+tab" => {
+                                    let _ = enigo_guard.key(Key::Alt, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Tab, Direction::Click);
+                                    let _ = enigo_guard.key(Key::Alt, Direction::Release);
+                                }
+                                "alt+f4" => {
+                                    let _ = enigo_guard.key(Key::Alt, Direction::Press);
+                                    let _ = enigo_guard.key(Key::F4, Direction::Click);
+                                    let _ = enigo_guard.key(Key::Alt, Direction::Release);
+                                }
+                                "ctrl+c" => {
+                                    let _ = enigo_guard.key(Key::Control, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Unicode('c'), Direction::Click);
+                                    let _ = enigo_guard.key(Key::Control, Direction::Release);
+                                }
+                                "ctrl+v" => {
+                                    let _ = enigo_guard.key(Key::Control, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Unicode('v'), Direction::Click);
+                                    let _ = enigo_guard.key(Key::Control, Direction::Release);
+                                }
+                                "ctrl+z" => {
+                                    let _ = enigo_guard.key(Key::Control, Direction::Press);
+                                    let _ = enigo_guard.key(Key::Unicode('z'), Direction::Click);
+                                    let _ = enigo_guard.key(Key::Control, Direction::Release);
+                                }
+                                "taskmgr" => {
+                                    let _ = Command::new("cmd").args(["/C", "start", "", "taskmgr"]).spawn();
+                                }
+                                "enter" | "return" => {
+                                    let _ = enigo_guard.key(Key::Return, Direction::Click);
+                                }
+                                "backspace" => {
+                                    let _ = enigo_guard.key(Key::Backspace, Direction::Click);
+                                }
+                                "escape" | "esc" => {
+                                    let _ = enigo_guard.key(Key::Escape, Direction::Click);
+                                }
+                                "tab" => {
+                                    let _ = enigo_guard.key(Key::Tab, Direction::Click);
+                                }
+                                "space" => {
+                                    let _ = enigo_guard.key(Key::Space, Direction::Click);
+                                }
+                                "up" => {
+                                    let _ = enigo_guard.key(Key::UpArrow, Direction::Click);
+                                }
+                                "down" => {
+                                    let _ = enigo_guard.key(Key::DownArrow, Direction::Click);
+                                }
+                                "left" => {
+                                    let _ = enigo_guard.key(Key::LeftArrow, Direction::Click);
+                                }
+                                "right" => {
+                                    let _ = enigo_guard.key(Key::RightArrow, Direction::Click);
+                                }
+                                "delete" | "del" => {
+                                    let _ = enigo_guard.key(Key::Delete, Direction::Click);
+                                }
+                                "home" => {
+                                    let _ = enigo_guard.key(Key::Home, Direction::Click);
+                                }
+                                "end" => {
+                                    let _ = enigo_guard.key(Key::End, Direction::Click);
+                                }
+                                "pageup" => {
+                                    let _ = enigo_guard.key(Key::PageUp, Direction::Click);
+                                }
+                                "pagedown" => {
+                                    let _ = enigo_guard.key(Key::PageDown, Direction::Click);
+                                }
+                                _ => {}
                             }
                         }
+                        // Open Website Shortcut in PC's default browser
+                        ClientMessage::OpenUrl { url } => {
+                            println!("[SHORTCUT] Opening site on PC: {}", url);
+                            let target = if !url.starts_with("http://") && !url.starts_with("https://") {
+                                format!("https://{}", url)
+                            } else {
+                                url
+                            };
+                            let _ = Command::new("cmd")
+                                .args(["/C", "start", "", &target])
+                                .spawn();
+                        }
+                        // Launch Desktop Application or Shortcut
+                        ClientMessage::LaunchApp { app } => {
+                            println!("[APP LAUNCHER] Launching application or file: {}", app);
+                            let _ = Command::new("cmd")
+                                .args(["/C", "start", "", &app])
+                                .spawn();
+                        }
+                        // Latency Ping
                         ClientMessage::Ping { timestamp } => {
                             let ts = timestamp.unwrap_or_else(|| {
                                 std::time::SystemTime::now()
@@ -614,4 +815,3 @@ async fn handle_connection(
 
     Ok(())
 }
-

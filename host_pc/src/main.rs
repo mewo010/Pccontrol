@@ -232,11 +232,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while capture_running.load(Ordering::Relaxed) {
             let start_time = Instant::now();
 
-            match manager.capture_frame() {
+            match manager.capture_frame_components() {
                 Ok((mut pixels, (width, height))) => {
                     width_ref.store(width, Ordering::Relaxed);
                     height_ref.store(height, Ordering::Relaxed);
 
+                    // pixels is Vec<u8> (BGRA raw byte components)
                     // Swizzle B and R in-place to RGBA for accurate JPEG color
                     for chunk in pixels.chunks_exact_mut(4) {
                         chunk.swap(0, 2);
@@ -324,7 +325,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Handles a single connected WebSocket client.
 async fn handle_connection(
     stream: TcpStream,
-    addr: SocketAddr,
+    _addr: SocketAddr,
     client_id: usize,
     mut frame_rx: broadcast::Receiver<FrameData>,
     enigo: Arc<Mutex<Enigo>>,

@@ -273,7 +273,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while capture_running.load(Ordering::Relaxed) {
             let start_time = Instant::now();
 
-            match manager.capture_frame() {
+            match manager.capture_frame_components() {
                 Ok((mut pixels, (width, height))) => {
                     width_ref.store(width, Ordering::Relaxed);
                     height_ref.store(height, Ordering::Relaxed);
@@ -361,7 +361,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn handle_connection(
     stream: TcpStream,
-    addr: SocketAddr,
+    _addr: SocketAddr,
     client_id: usize,
     mut frame_rx: broadcast::Receiver<FrameData>,
     enigo: Arc<Mutex<Enigo>>,

@@ -56,16 +56,6 @@ class WebShortcutItem {
   final IconData icon;
 
   const WebShortcutItem({required this.name, required this.url, required this.icon});
-
-  Map<String, dynamic> toJson() => {'name': name, 'url': url};
-
-  factory WebShortcutItem.fromJson(Map<String, dynamic> json) {
-    return WebShortcutItem(
-      name: json['name'] ?? '',
-      url: json['url'] ?? '',
-      icon: Icons.language,
-    );
-  }
 }
 
 class RemoteControllerScreen extends StatefulWidget {
@@ -102,13 +92,15 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   double _remoteHeight = 1080;
   String _hostPcName = '';
 
-  // Display Mode: Aspect Ratio Fit vs Full Screen Stretch
-  bool _isFitScreen = true;
+  // Active Screen Tab: 0 = Touchpad, 1 = Screen Mirror, 2 = Apps & Shortcuts
+  int _currentTabIndex = 0;
 
-  // Control Mode: Direct Touch Screen vs Laptop Trackpad
-  bool _isDirectTouchMode = true;
+  // Trackpad Settings
+  double _trackpadSensitivity = 1.5;
   bool _isDragLocked = false;
-  final double _trackpadSensitivity = 1.35;
+
+  // Screen View Fit/Stretch
+  bool _isFitScreen = true;
 
   // Custom Websites & Shortcuts
   final List<WebShortcutItem> _webShortcuts = [
@@ -189,7 +181,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             _isScanning = false;
             _statusMessage = 'No PC found automatically. Enter IP manually.';
           });
-          _showToast('No PC found. Enter IP manually or verify same Wi-Fi.');
+          _showToast('No PC found. Enter IP manually or check same Wi-Fi.');
         }
       });
     } catch (e) {
@@ -197,9 +189,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       if (mounted) {
         setState(() {
           _isScanning = false;
-          _statusMessage = 'Auto-detect unavailable. Enter PC IP from host window and tap Connect.';
+          _statusMessage = 'Enter PC IP from host window and tap Connect.';
         });
-        _showToast('Enter PC IP directly from your PC host window');
       }
     }
   }
@@ -280,6 +271,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         _isConnecting = false;
         _latencyMs = 0;
         _renderedFps = 0;
+        _latestFrameBytes = null;
         _statusMessage = 'Disconnected';
       });
     }
@@ -349,6 +341,50 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     } catch (_) {}
   }
 
+  // --- Mouse Actions ---
+
+  void _handleTrackpadMove(DragUpdateDetails details) {
+    final dx = details.delta.dx * _trackpadSensitivity;
+    final dy = details.delta.dy * _trackpadSensitivity;
+    _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
+  }
+
+  void _handleLeftClick() {
+    _sendJson({'type': 'click', 'button': 'left'});
+    HapticFeedback.lightImpact();
+  }
+
+  void _handleRightClick() {
+    _sendJson({'type': 'click', 'button': 'right'});
+    HapticFeedback.mediumImpact();
+    _showToast('Right clicked');
+  }
+
+  void _handleDoubleClick() {
+    _sendJson({'type': 'double_click', 'button': 'left'});
+    HapticFeedback.selectionClick();
+  }
+
+  void _handleScroll(int dy) {
+    _sendJson({'type': 'scroll', 'dy': dy});
+  }
+
+  void _toggleDragLock() {
+    setState(() {
+      _isDragLocked = !_isDragLocked;
+    });
+    if (_isDragLocked) {
+      _sendJson({'type': 'mouse_down', 'button': 'left'});
+      _showToast('Drag locked (mouse held down)');
+    } else {
+      _sendJson({'type': 'mouse_up', 'button': 'left'});
+      _showToast('Drag released');
+    }
+    HapticFeedback.mediumImpact();
+  }
+
+  // --- Direct Touch on Screen View ---
+
   Offset? _getNormalizedCoordinates(Offset localPosition) {
     final RenderBox? box =
         _viewportKey.currentContext?.findRenderObject() as RenderBox?;
@@ -385,72 +421,59 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     final double touchInsideX = localPosition.dx - offsetX;
     final double touchInsideY = localPosition.dy - offsetY;
 
+    if (touchInsideX < 0 ||
+        touchInsideX > renderedWidth ||
+        touchInsideY < 0 ||
+        touchInsideY > renderedHeight) {
+      return null;
+    }
+
     return Offset(
       (touchInsideX / renderedWidth).clamp(0.0, 1.0),
       (touchInsideY / renderedHeight).clamp(0.0, 1.0),
     );
   }
 
-  void _handleDirectTouchTap(Offset localPosition) {
+  void _handleScreenTap(Offset localPosition) {
     final coords = _getNormalizedCoordinates(localPosition);
     if (coords == null) return;
-
     _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
     _sendJson({'type': 'click', 'button': 'left'});
   }
 
-  void _handleDirectTouchDoubleTap(Offset localPosition) {
+  void _handleScreenLongPress(Offset localPosition) {
     final coords = _getNormalizedCoordinates(localPosition);
     if (coords == null) return;
-
-    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
-    _sendJson({'type': 'double_click', 'button': 'left'});
-  }
-
-  void _handleDirectTouchLongPress(Offset localPosition) {
-    final coords = _getNormalizedCoordinates(localPosition);
-    if (coords == null) return;
-
     _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
     _sendJson({'type': 'click', 'button': 'right'});
     HapticFeedback.mediumImpact();
     _showToast('Right clicked');
   }
 
-  void _handleDirectTouchPanStart(DragStartDetails details) {
-    if (_isDirectTouchMode) {
-      final coords = _getNormalizedCoordinates(details.localPosition);
-      if (coords != null) {
-        _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
-        _sendJson({'type': 'mouse_down', 'button': 'left'});
-      }
+  void _handleScreenPanStart(DragStartDetails details) {
+    final coords = _getNormalizedCoordinates(details.localPosition);
+    if (coords != null) {
+      _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+      _sendJson({'type': 'mouse_down', 'button': 'left'});
     }
   }
 
-  void _handleDirectTouchPanUpdate(DragUpdateDetails details) {
-    if (_isDirectTouchMode) {
-      final coords = _getNormalizedCoordinates(details.localPosition);
-      if (coords != null) {
-        _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
-      }
-    } else {
-      // Precision Trackpad relative movement
-      final dx = details.delta.dx * _trackpadSensitivity;
-      final dy = details.delta.dy * _trackpadSensitivity;
-      _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
+  void _handleScreenPanUpdate(DragUpdateDetails details) {
+    final coords = _getNormalizedCoordinates(details.localPosition);
+    if (coords != null) {
+      _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
     }
   }
 
-  void _handleDirectTouchPanEnd(DragEndDetails details) {
-    if (_isDirectTouchMode) {
-      _sendJson({'type': 'mouse_up', 'button': 'left'});
-    }
+  void _handleScreenPanEnd(DragEndDetails details) {
+    _sendJson({'type': 'mouse_up', 'button': 'left'});
   }
+
+  // --- Keyboard & App Launchers ---
 
   void _sendTypingText() {
     final text = _textController.text;
     if (text.isEmpty) return;
-
     _sendJson({'type': 'type', 'text': text});
     _textController.clear();
   }
@@ -489,7 +512,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               controller: nameCtrl,
               autofocus: true,
               style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(labelText: 'Shortcut Name (e.g. My Anime Site, Work Jira)'),
+              decoration: const InputDecoration(labelText: 'Shortcut Name (e.g. My Anime Site)'),
             ),
             const SizedBox(height: 12),
             TextField(
@@ -524,188 +547,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  void _showShortcutsAndAppsSheet() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF0F172A),
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => DefaultTabController(
-        length: 2,
-        child: Container(
-          height: MediaQuery.of(context).size.height * 0.7,
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          child: Column(
-            children: [
-              Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(color: const Color(0xFF475569), borderRadius: BorderRadius.circular(2)),
-              ),
-              const SizedBox(height: 12),
-              const TabBar(
-                indicatorColor: Color(0xFF38BDF8),
-                labelColor: Color(0xFF38BDF8),
-                unselectedLabelColor: Color(0xFF94A3B8),
-                tabs: [
-                  Tab(icon: Icon(Icons.language), text: 'Websites & Shortcuts'),
-                  Tab(icon: Icon(Icons.apps), text: 'PC & Desktop Apps'),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: TabBarView(
-                  children: [
-                    // Tab 1: Websites & Custom Shortcuts
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text('QUICK WEB SHORTCUTS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                            TextButton.icon(
-                              onPressed: _showAddShortcutDialog,
-                              icon: const Icon(Icons.add, size: 16, color: Color(0xFF38BDF8)),
-                              label: const Text('Add Custom Site', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 12)),
-                            ),
-                          ],
-                        ),
-                        Expanded(
-                          child: GridView.builder(
-                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 3,
-                              childAspectRatio: 2.2,
-                              crossAxisSpacing: 8,
-                              mainAxisSpacing: 8,
-                            ),
-                            itemCount: _webShortcuts.length,
-                            itemBuilder: (context, index) {
-                              final item = _webShortcuts[index];
-                              return InkWell(
-                                onTap: () {
-                                  Navigator.pop(ctx);
-                                  _openWebUrl(item.url);
-                                },
-                                borderRadius: BorderRadius.circular(8),
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF1E293B),
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(color: const Color(0xFF334155)),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      Icon(item.icon, size: 20, color: const Color(0xFF38BDF8)),
-                                      const SizedBox(width: 6),
-                                      Expanded(
-                                        child: Text(
-                                          item.name,
-                                          style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-
-                    // Tab 2: Apps & Desktop Launcher
-                    SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('LAUNCH ANY APP OR DESKTOP SHORTCUT', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: _customAppController,
-                                  style: const TextStyle(color: Colors.white, fontSize: 13),
-                                  decoration: const InputDecoration(
-                                    hintText: 'e.g. chrome, steam, discord, calc, notepad',
-                                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              ElevatedButton(
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF0284C7),
-                                  foregroundColor: Colors.white,
-                                ),
-                                onPressed: () {
-                                  Navigator.pop(ctx);
-                                  _launchApp(_customAppController.text);
-                                },
-                                child: const Text('Launch'),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-                          const Text('POPULAR PC APPLICATIONS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                          const SizedBox(height: 8),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              _buildAppLaunchChip(ctx, 'File Explorer', 'explorer', Icons.folder),
-                              _buildAppLaunchChip(ctx, 'Desktop Folder', 'explorer shell:Desktop', Icons.desktop_windows),
-                              _buildAppLaunchChip(ctx, 'Task Manager', 'taskmgr', Icons.analytics),
-                              _buildAppLaunchChip(ctx, 'Chrome', 'chrome', Icons.public),
-                              _buildAppLaunchChip(ctx, 'Command Prompt', 'cmd', Icons.terminal),
-                              _buildAppLaunchChip(ctx, 'PowerShell', 'powershell', Icons.code),
-                              _buildAppLaunchChip(ctx, 'Notepad', 'notepad', Icons.description),
-                              _buildAppLaunchChip(ctx, 'Calculator', 'calc', Icons.calculate),
-                              _buildAppLaunchChip(ctx, 'Settings', 'ms-settings:', Icons.settings),
-                              _buildAppLaunchChip(ctx, 'Steam', 'steam', Icons.sports_esports),
-                              _buildAppLaunchChip(ctx, 'Spotify', 'spotify', Icons.music_note),
-                              _buildAppLaunchChip(ctx, 'Discord', 'discord', Icons.chat),
-                              _buildAppLaunchChip(ctx, 'VS Code', 'code', Icons.integration_instructions),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildAppLaunchChip(BuildContext ctx, String label, String cmd, IconData icon) {
-    return ActionChip(
-      backgroundColor: const Color(0xFF1E293B),
-      side: const BorderSide(color: Color(0xFF334155)),
-      avatar: Icon(icon, size: 16, color: const Color(0xFF38BDF8)),
-      label: Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
-      onPressed: () {
-        Navigator.pop(ctx);
-        _launchApp(cmd);
-      },
-    );
-  }
-
   void _showToast(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 2),
-      ),
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
     );
   }
 
@@ -716,9 +560,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         child: Column(
           children: [
             _buildHeader(),
-            Expanded(child: _buildScreenViewport()),
-            _buildQuickMouseControlBar(),
-            _buildActionBar(),
+            Expanded(child: _buildCurrentTabBody()),
+            _buildBottomNavigationBar(),
           ],
         ),
       ),
@@ -813,321 +656,272 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               child: Text(_isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 12)),
             ),
           ),
-          const SizedBox(width: 6),
 
-          // Aspect Ratio Fit / Fill Toggle
-          IconButton(
-            onPressed: () => setState(() => _isFitScreen = !_isFitScreen),
-            icon: Icon(
-              _isFitScreen ? Icons.aspect_ratio : Icons.fullscreen,
-              color: const Color(0xFF38BDF8),
-              size: 20,
-            ),
-            tooltip: _isFitScreen ? 'Switch to Stretch Fill' : 'Switch to Aspect Ratio Fit',
-          ),
-
-          // Shortcuts & Apps Sheet Trigger
-          IconButton(
-            onPressed: _showShortcutsAndAppsSheet,
-            icon: const Icon(Icons.rocket_launch, color: Color(0xFF38BDF8), size: 20),
-            tooltip: 'Websites & Apps Launcher',
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildScreenViewport() {
-    return Container(
-      key: _viewportKey,
-      color: Colors.black,
-      child: _latestFrameBytes != null
-          ? GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              // Direct Touch Screen Handlers
-              onTapDown: (details) {
-                if (_isDirectTouchMode) {
-                  _handleDirectTouchTap(details.localPosition);
-                } else {
-                  _sendJson({'type': 'click', 'button': 'left'});
-                }
-              },
-              onDoubleTapDown: (details) {
-                if (_isDirectTouchMode) {
-                  _handleDirectTouchDoubleTap(details.localPosition);
-                } else {
-                  _sendJson({'type': 'double_click', 'button': 'left'});
-                }
-              },
-              onLongPressStart: (details) {
-                if (_isDirectTouchMode) {
-                  _handleDirectTouchLongPress(details.localPosition);
-                } else {
-                  _sendJson({'type': 'click', 'button': 'right'});
-                }
-              },
-              onPanStart: _handleDirectTouchPanStart,
-              onPanUpdate: _handleDirectTouchPanUpdate,
-              onPanEnd: _handleDirectTouchPanEnd,
-              child: Center(
-                child: _isFitScreen
-                    ? AspectRatio(
-                        aspectRatio: _remoteWidth / _remoteHeight,
-                        child: Image.memory(
-                          _latestFrameBytes!,
-                          fit: BoxFit.contain,
-                          gaplessPlayback: true,
-                          filterQuality: FilterQuality.low,
-                        ),
-                      )
-                    : SizedBox.expand(
-                        child: Image.memory(
-                          _latestFrameBytes!,
-                          fit: BoxFit.fill,
-                          gaplessPlayback: true,
-                          filterQuality: FilterQuality.low,
-                        ),
-                      ),
-              ),
-            )
-          : Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _isConnected ? Icons.videocam : Icons.screen_share_outlined,
-                    size: 48,
-                    color: const Color(0xFF64748B),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    _isConnected ? 'Waiting for screen frames from PC...' : _statusMessage,
-                    style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 14),
-                  ),
-                  if (_isConnected) ...[
-                    const SizedBox(height: 12),
-                    const SizedBox(
-                      width: 24,
-                      height: 24,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF38BDF8)),
-                    ),
-                  ],
-                  if (!_isConnected && !_isScanning)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 14.0),
-                      child: ElevatedButton.icon(
-                        onPressed: _autoDiscoverPc,
-                        icon: const Icon(Icons.wifi_find, size: 16),
-                        label: const Text('Auto-Detect PC on Wi-Fi'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF0369A1),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-    );
-  }
-
-  /// Toolbar for switching between Touch Screen and Trackpad Mouse Modes, with mouse buttons
-  Widget _buildQuickMouseControlBar() {
-    return Container(
-      color: const Color(0xFF0F172A),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: Row(
-        children: [
-          // Mode Toggle: Touch Screen vs Trackpad
-          Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF1E293B),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF334155)),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                InkWell(
-                  onTap: () => setState(() => _isDirectTouchMode = true),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: _isDirectTouchMode ? const Color(0xFF0284C7) : Colors.transparent,
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Row(
-                      children: const [
-                        Icon(Icons.touch_app, size: 14, color: Colors.white),
-                        SizedBox(width: 4),
-                        Text('Touch Screen', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
-                      ],
-                    ),
-                  ),
-                ),
-                InkWell(
-                  onTap: () => setState(() => _isDirectTouchMode = false),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: !_isDirectTouchMode ? const Color(0xFF0284C7) : Colors.transparent,
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Row(
-                      children: const [
-                        Icon(Icons.mouse, size: 14, color: Colors.white),
-                        SizedBox(width: 4),
-                        Text('Trackpad', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // Live stats badge
           if (_isConnected) ...[
             const SizedBox(width: 8),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
               decoration: BoxDecoration(
-                color: const Color(0xFF1E293B),
+                color: const Color(0xFF0F172A),
                 borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF334155)),
               ),
               child: Text(
-                '$_renderedFps FPS | ${_latencyMs}ms',
-                style: const TextStyle(fontSize: 10, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold),
+                '${_renderedFps} FPS | ${_latencyMs}ms',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold),
               ),
             ),
           ],
-
-          const Spacer(),
-
-          // Mouse Action Buttons
-          _buildQuickActionButton('Left Click', Icons.mouse, () => _sendJson({'type': 'click', 'button': 'left'})),
-          const SizedBox(width: 6),
-          _buildQuickActionButton('Right Click', Icons.mouse_outlined, () => _sendJson({'type': 'click', 'button': 'right'})),
-          const SizedBox(width: 6),
-          _buildQuickActionButton('Double', Icons.filter_2, () => _sendJson({'type': 'double_click', 'button': 'left'})),
-          const SizedBox(width: 6),
-          _buildQuickActionButton('Scroll ▲', Icons.arrow_upward, () => _sendJson({'type': 'scroll', 'dy': -3})),
-          const SizedBox(width: 6),
-          _buildQuickActionButton('Scroll ▼', Icons.arrow_downward, () => _sendJson({'type': 'scroll', 'dy': 3})),
         ],
       ),
     );
   }
 
-  Widget _buildQuickActionButton(String label, IconData icon, VoidCallback onPressed) {
-    return InkWell(
-      onTap: _isConnected ? onPressed : null,
-      borderRadius: BorderRadius.circular(6),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1E293B),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: const Color(0xFF334155)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 13, color: const Color(0xFF38BDF8)),
-            const SizedBox(width: 4),
-            Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
-          ],
-        ),
-      ),
-    );
+  Widget _buildCurrentTabBody() {
+    switch (_currentTabIndex) {
+      case 0:
+        return _buildDedicatedTouchpadTab();
+      case 1:
+        return _buildScreenMirrorTab();
+      case 2:
+        return _buildShortcutsAndAppsTab();
+      default:
+        return _buildDedicatedTouchpadTab();
+    }
   }
 
-  Widget _buildActionBar() {
+  /// TAB 0: Dedicated Laptop Touchpad UI with Visible Trackpad & Big Click Buttons
+  Widget _buildDedicatedTouchpadTab() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 8.0),
-      decoration: const BoxDecoration(
-        color: Color(0xFF1E293B),
-        border: Border(top: BorderSide(color: Color(0xFF334155))),
-      ),
+      color: const Color(0xFF0B1120),
+      padding: const EdgeInsets.all(12.0),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         children: [
+          // Top sensitivity bar
           Row(
             children: [
+              const Icon(Icons.speed, size: 16, color: Color(0xFF94A3B8)),
+              const SizedBox(width: 6),
+              const Text('Cursor Speed:', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12)),
+              const SizedBox(width: 8),
               Expanded(
-                child: SizedBox(
-                  height: 38,
-                  child: TextField(
-                    controller: _textController,
-                    focusNode: _textFocusNode,
-                    enabled: _isConnected,
-                    onSubmitted: (_) => _sendTypingText(),
-                    style: const TextStyle(fontSize: 13, color: Colors.white),
-                    decoration: const InputDecoration(
-                      hintText: 'Type text to send to PC...',
-                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
-                    ),
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                  ),
+                  child: Slider(
+                    value: _trackpadSensitivity,
+                    min: 0.8,
+                    max: 2.8,
+                    divisions: 10,
+                    activeColor: const Color(0xFF38BDF8),
+                    onChanged: (val) => setState(() => _trackpadSensitivity = val),
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              SizedBox(
-                height: 38,
-                child: ElevatedButton.icon(
-                  onPressed: _isConnected ? _sendTypingText : null,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF38BDF8),
-                    foregroundColor: const Color(0xFF0F172A),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
-                  icon: const Icon(Icons.send, size: 16),
-                  label: const Text('Send'),
-                ),
+              Text(
+                '${_trackpadSensitivity.toStringAsFixed(1)}x',
+                style: const TextStyle(color: Color(0xFF38BDF8), fontWeight: FontWeight.bold, fontSize: 12),
               ),
             ],
           ),
           const SizedBox(height: 8),
+
+          // Main Visual Touchpad Card
+          Expanded(
+            child: Row(
+              children: [
+                // Trackpad Glide Area
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanUpdate: _handleTrackpadMove,
+                    onTap: _handleLeftClick,
+                    onDoubleTap: _handleDoubleClick,
+                    onLongPress: _handleRightClick,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: _isDragLocked ? const Color(0xFFF59E0B) : const Color(0xFF38BDF8).withOpacity(0.5),
+                          width: 2,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.4),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          // Center guidance text & icon
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _isDragLocked ? Icons.lock : Icons.touch_app,
+                                size: 54,
+                                color: _isDragLocked
+                                    ? const Color(0xFFF59E0B)
+                                    : const Color(0xFF38BDF8).withOpacity(0.6),
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                _isDragLocked ? 'DRAG LOCK ACTIVE (MOUSE DOWN)' : 'LAPTOP TOUCHPAD',
+                                style: TextStyle(
+                                  color: _isDragLocked ? const Color(0xFFF59E0B) : const Color(0xFFF8FAFC),
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 1.2,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              const Text(
+                                'Slide finger to glide PC mouse\nTap to Left Click • Long press to Right Click',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(width: 10),
+
+                // Dedicated Scroll Strip on the right
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onVerticalDragUpdate: (details) {
+                    final int scrollStep = details.delta.dy > 0 ? 3 : -3;
+                    _handleScroll(scrollStep);
+                  },
+                  child: Container(
+                    width: 54,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E293B),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF334155)),
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: const [
+                        Icon(Icons.arrow_drop_up, color: Color(0xFF38BDF8), size: 28),
+                        RotatedBox(
+                          quarterTurns: 3,
+                          child: Text(
+                            'SCROLL',
+                            style: TextStyle(
+                              color: Color(0xFF94A3B8),
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 2,
+                            ),
+                          ),
+                        ),
+                        Icon(Icons.arrow_drop_down, color: Color(0xFF38BDF8), size: 28),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 12),
+
+          // Big Physical Mouse Buttons: LEFT CLICK & RIGHT CLICK
+          SizedBox(
+            height: 62,
+            child: Row(
+              children: [
+                // Big Left Click Button
+                Expanded(
+                  flex: 5,
+                  child: ElevatedButton.icon(
+                    onPressed: _isConnected ? _handleLeftClick : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0284C7),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      elevation: 4,
+                    ),
+                    icon: const Icon(Icons.mouse, size: 22),
+                    label: const Text(
+                      'LEFT CLICK',
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(width: 8),
+
+                // Drag Lock Toggle Button
+                SizedBox(
+                  width: 58,
+                  height: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _isConnected ? _toggleDragLock : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _isDragLocked ? const Color(0xFFF59E0B) : const Color(0xFF334155),
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.zero,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: Icon(_isDragLocked ? Icons.lock : Icons.lock_open, size: 22),
+                  ),
+                ),
+
+                const SizedBox(width: 8),
+
+                // Big Right Click Button
+                Expanded(
+                  flex: 5,
+                  child: ElevatedButton.icon(
+                    onPressed: _isConnected ? _handleRightClick : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1E293B),
+                      foregroundColor: const Color(0xFF38BDF8),
+                      side: const BorderSide(color: Color(0xFF0284C7), width: 1.5),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      elevation: 4,
+                    ),
+                    icon: const Icon(Icons.mouse_outlined, size: 22),
+                    label: const Text(
+                      'RIGHT CLICK',
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // Quick System Action Row
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                // Prominent Windows Start Menu Key
-                ElevatedButton.icon(
-                  onPressed: _isConnected ? () => _sendKey('win') : null,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF0284C7),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    minimumSize: Size.zero,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                  ),
-                  icon: const Icon(Icons.window, size: 16),
-                  label: const Text('Win (Start)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                ),
+                _buildQuickPill('Win (Start)', 'win', Icons.window, isPrimary: true),
                 const SizedBox(width: 6),
-                _buildKeyButton('Win+D (Desktop)', 'desktop', Icons.desktop_windows),
+                _buildQuickPill('Show Desktop', 'desktop', Icons.desktop_windows),
                 const SizedBox(width: 6),
-                _buildKeyButton('TaskMgr', 'taskmgr', Icons.analytics_outlined),
+                _buildQuickPill('Task Manager', 'taskmgr', Icons.analytics),
                 const SizedBox(width: 6),
-                _buildKeyButton('Alt+Tab', 'alt+tab', Icons.switch_access_shortcut),
+                _buildQuickPill('Alt+Tab', 'alt+tab', Icons.switch_access_shortcut),
                 const SizedBox(width: 6),
-                _buildKeyButton('Enter', 'enter', Icons.keyboard_return),
+                _buildQuickPill('Double Click', 'double_click', Icons.filter_2, isAction: true),
                 const SizedBox(width: 6),
-                _buildKeyButton('Backspace', 'backspace', Icons.backspace_outlined),
-                const SizedBox(width: 6),
-                _buildKeyButton('Esc', 'escape', Icons.close),
-                const SizedBox(width: 6),
-                _buildKeyButton('Tab', 'tab', Icons.keyboard_tab),
-                const SizedBox(width: 6),
-                _buildKeyButton('Space', 'space', Icons.space_bar),
-                const SizedBox(width: 6),
-                _buildKeyButton('Copy', 'ctrl+c', Icons.copy),
-                const SizedBox(width: 6),
-                _buildKeyButton('Paste', 'ctrl+v', Icons.paste),
-                const SizedBox(width: 6),
-                _buildKeyButton('Undo', 'ctrl+z', Icons.undo),
+                _buildQuickPill('Esc', 'escape', Icons.close),
               ],
             ),
           ),
@@ -1136,19 +930,303 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  Widget _buildKeyButton(String label, String keyVal, IconData icon) {
-    return OutlinedButton.icon(
-      onPressed: _isConnected ? () => _sendKey(keyVal) : null,
-      style: OutlinedButton.styleFrom(
-        foregroundColor: Colors.white70,
-        side: const BorderSide(color: Color(0xFF475569)),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        minimumSize: Size.zero,
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+  Widget _buildQuickPill(String label, String keyVal, IconData icon, {bool isPrimary = false, bool isAction = false}) {
+    return ElevatedButton.icon(
+      onPressed: _isConnected
+          ? () {
+              if (isAction && keyVal == 'double_click') {
+                _handleDoubleClick();
+              } else {
+                _sendKey(keyVal);
+              }
+            }
+          : null,
+      style: ElevatedButton.styleFrom(
+        backgroundColor: isPrimary ? const Color(0xFF0284C7) : const Color(0xFF1E293B),
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
       icon: Icon(icon, size: 14),
       label: Text(label, style: const TextStyle(fontSize: 12)),
+    );
+  }
+
+  /// TAB 1: Live Screen Mirroring View with Direct Touch & Fit/Stretch Modes
+  Widget _buildScreenMirrorTab() {
+    return Container(
+      key: _viewportKey,
+      color: Colors.black,
+      child: Stack(
+        children: [
+          _latestFrameBytes != null
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) => _handleScreenTap(details.localPosition),
+                  onLongPressStart: (details) => _handleScreenLongPress(details.localPosition),
+                  onPanStart: _handleScreenPanStart,
+                  onPanUpdate: _handleScreenPanUpdate,
+                  onPanEnd: _handleScreenPanEnd,
+                  child: Center(
+                    child: _isFitScreen
+                        ? AspectRatio(
+                            aspectRatio: _remoteWidth / _remoteHeight,
+                            child: Image.memory(
+                              _latestFrameBytes!,
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                              filterQuality: FilterQuality.low,
+                            ),
+                          )
+                        : SizedBox.expand(
+                            child: Image.memory(
+                              _latestFrameBytes!,
+                              fit: BoxFit.fill,
+                              gaplessPlayback: true,
+                              filterQuality: FilterQuality.low,
+                            ),
+                          ),
+                  ),
+                )
+              : Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20.0),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.videocam, size: 54, color: Color(0xFF38BDF8)),
+                        const SizedBox(height: 14),
+                        Text(
+                          _isConnected
+                              ? 'Connecting to PC display stream...'
+                              : _statusMessage,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 15, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 10),
+                        const Text(
+                          'You can use the Touchpad tab to control your PC mouse right away!',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                        ),
+                        const SizedBox(height: 18),
+                        ElevatedButton.icon(
+                          onPressed: () => setState(() => _currentTabIndex = 0),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF0284C7),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          ),
+                          icon: const Icon(Icons.mouse, size: 18),
+                          label: const Text('Open Laptop Touchpad', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+          // Floating Fit/Stretch Button
+          if (_latestFrameBytes != null)
+            Positioned(
+              top: 10,
+              right: 10,
+              child: FloatingActionButton.small(
+                backgroundColor: const Color(0xFF1E293B).withOpacity(0.85),
+                foregroundColor: const Color(0xFF38BDF8),
+                onPressed: () => setState(() => _isFitScreen = !_isFitScreen),
+                tooltip: _isFitScreen ? 'Switch to Stretch Fill' : 'Switch to Aspect Ratio Fit',
+                child: Icon(_isFitScreen ? Icons.aspect_ratio : Icons.fullscreen),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// TAB 2: Websites, Custom Shortcuts & PC App Launcher
+  Widget _buildShortcutsAndAppsTab() {
+    return Container(
+      color: const Color(0xFF0B1120),
+      padding: const EdgeInsets.all(14.0),
+      child: DefaultTabController(
+        length: 2,
+        child: Column(
+          children: [
+            const TabBar(
+              indicatorColor: Color(0xFF38BDF8),
+              labelColor: Color(0xFF38BDF8),
+              unselectedLabelColor: Color(0xFF94A3B8),
+              tabs: [
+                Tab(icon: Icon(Icons.language), text: 'Websites & Shortcuts'),
+                Tab(icon: Icon(Icons.apps), text: 'PC & Desktop Apps'),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: TabBarView(
+                children: [
+                  // Tab 1: Websites & Custom Shortcuts
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('QUICK WEB SHORTCUTS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                          TextButton.icon(
+                            onPressed: _showAddShortcutDialog,
+                            icon: const Icon(Icons.add, size: 16, color: Color(0xFF38BDF8)),
+                            label: const Text('Add Custom Site', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                      Expanded(
+                        child: GridView.builder(
+                          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 3,
+                            childAspectRatio: 2.2,
+                            crossAxisSpacing: 8,
+                            mainAxisSpacing: 8,
+                          ),
+                          itemCount: _webShortcuts.length,
+                          itemBuilder: (context, index) {
+                            final item = _webShortcuts[index];
+                            return InkWell(
+                              onTap: () => _openWebUrl(item.url),
+                              borderRadius: BorderRadius.circular(8),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF1E293B),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: const Color(0xFF334155)),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(item.icon, size: 20, color: const Color(0xFF38BDF8)),
+                                    const SizedBox(width: 6),
+                                    Expanded(
+                                      child: Text(
+                                        item.name,
+                                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // Tab 2: Apps & Desktop Launcher
+                  SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('LAUNCH ANY APP OR DESKTOP SHORTCUT', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _customAppController,
+                                style: const TextStyle(color: Colors.white, fontSize: 13),
+                                decoration: const InputDecoration(
+                                  hintText: 'e.g. chrome, steam, discord, calc, notepad',
+                                  contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF0284C7),
+                                foregroundColor: Colors.white,
+                              ),
+                              onPressed: () => _launchApp(_customAppController.text),
+                              child: const Text('Launch'),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        const Text('POPULAR PC APPLICATIONS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _buildAppLaunchChip('File Explorer', 'explorer', Icons.folder),
+                            _buildAppLaunchChip('Desktop Folder', 'explorer shell:Desktop', Icons.desktop_windows),
+                            _buildAppLaunchChip('Task Manager', 'taskmgr', Icons.analytics),
+                            _buildAppLaunchChip('Chrome', 'chrome', Icons.public),
+                            _buildAppLaunchChip('Command Prompt', 'cmd', Icons.terminal),
+                            _buildAppLaunchChip('PowerShell', 'powershell', Icons.code),
+                            _buildAppLaunchChip('Notepad', 'notepad', Icons.description),
+                            _buildAppLaunchChip('Calculator', 'calc', Icons.calculate),
+                            _buildAppLaunchChip('Settings', 'ms-settings:', Icons.settings),
+                            _buildAppLaunchChip('Steam', 'steam', Icons.sports_esports),
+                            _buildAppLaunchChip('Spotify', 'spotify', Icons.music_note),
+                            _buildAppLaunchChip('Discord', 'discord', Icons.chat),
+                            _buildAppLaunchChip('VS Code', 'code', Icons.integration_instructions),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAppLaunchChip(String label, String cmd, IconData icon) {
+    return ActionChip(
+      backgroundColor: const Color(0xFF1E293B),
+      side: const BorderSide(color: Color(0xFF334155)),
+      avatar: Icon(icon, size: 16, color: const Color(0xFF38BDF8)),
+      label: Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
+      onPressed: () => _launchApp(cmd),
+    );
+  }
+
+  /// Bottom Navigation Bar to easily switch between Touchpad, Screen Mirror & Shortcuts
+  Widget _buildBottomNavigationBar() {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E293B),
+        border: Border(top: BorderSide(color: Color(0xFF334155))),
+      ),
+      child: BottomNavigationBar(
+        currentIndex: _currentTabIndex,
+        onTap: (idx) => setState(() => _currentTabIndex = idx),
+        backgroundColor: const Color(0xFF1E293B),
+        selectedItemColor: const Color(0xFF38BDF8),
+        unselectedItemColor: const Color(0xFF94A3B8),
+        type: BottomNavigationBarType.fixed,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.mouse),
+            label: 'Touchpad',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.screen_share),
+            label: 'Screen Mirror',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.rocket_launch),
+            label: 'Apps & Web',
+          ),
+        ],
+      ),
     );
   }
 }

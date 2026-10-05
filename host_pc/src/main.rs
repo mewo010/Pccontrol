@@ -6,7 +6,8 @@
 //! - Auto-Firewall Rule Configuration (Port 8765 TCP & 8766 UDP)
 //! - UDP Auto-Discovery Beacon (Mobile app discovers PC with 1 click, no typing)
 //! - Multi-Engine Screen Capture via XCap (Hardware DXGI + Windows Graphics Capture + GDI Fallback)
-//! - Direct Win32 OS Cursor Control (SetCursorPos & mouse_event for 100% reliable mouse movement & click)
+//! - Direct Win32 OS Cursor Control (SetCursorPos & GetCursorPos for 100% reliable mouse movement)
+//! - Enigo mouse button, scroll, keyboard text & key injection
 //! - Windows Key & Keyboard shortcuts (Win / Meta Start Menu, Alt+Tab, Win+D, TaskMgr)
 //! - Web Shortcut Launcher (opens sites on PC default browser)
 //! - Desktop App Launcher (opens apps & shortcuts on PC)
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ColorType;
@@ -439,7 +440,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             // Find primary monitor, or default to first monitor
-            let primary_idx = monitors.iter().position(|m| m.is_primary()).unwrap_or(0);
+            let primary_idx = monitors.iter().position(|m| m.is_primary().unwrap_or(false)).unwrap_or(0);
             let monitor = &monitors[primary_idx];
 
             match monitor.capture_image() {
@@ -629,83 +630,64 @@ async fn handle_connection(
                                 );
                             }
                         }
-                        // Laptop Trackpad / Relative Mouse Movement via Windows mouse_event
+                        // Laptop Trackpad / Relative Mouse Movement via Windows user32 GetCursorPos + SetCursorPos
                         ClientMessage::MoveRelative { dx, dy } => {
                             unsafe {
-                                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                                    mouse_event, MOUSEEVENTF_MOVE,
-                                };
-                                mouse_event(MOUSEEVENTF_MOVE, dx as i32, dy as i32, 0, 0);
+                                let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+                                if windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) != 0 {
+                                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
+                                        pt.x + dx as i32,
+                                        pt.y + dy as i32,
+                                    );
+                                }
                             }
                         }
                         // Mouse Press / Dragging
                         ClientMessage::MouseDown { button } => {
-                            unsafe {
-                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
-                                let flag = match button.to_lowercase().as_str() {
-                                    "right" => MOUSEEVENTF_RIGHTDOWN,
-                                    "middle" => MOUSEEVENTF_MIDDLEDOWN,
-                                    _ => MOUSEEVENTF_LEFTDOWN,
-                                };
-                                mouse_event(flag, 0, 0, 0, 0);
-                            }
+                            let mut enigo_guard = enigo.lock().await;
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Press);
                         }
                         // Mouse Release
                         ClientMessage::MouseUp { button } => {
-                            unsafe {
-                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
-                                let flag = match button.to_lowercase().as_str() {
-                                    "right" => MOUSEEVENTF_RIGHTUP,
-                                    "middle" => MOUSEEVENTF_MIDDLEUP,
-                                    _ => MOUSEEVENTF_LEFTUP,
-                                };
-                                mouse_event(flag, 0, 0, 0, 0);
-                            }
+                            let mut enigo_guard = enigo.lock().await;
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Release);
                         }
                         // Mouse Click
                         ClientMessage::Click { button } => {
-                            unsafe {
-                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
-                                match button.to_lowercase().as_str() {
-                                    "right" => {
-                                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-                                        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-                                    }
-                                    "middle" => {
-                                        mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
-                                        mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
-                                    }
-                                    _ => {
-                                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                                    }
-                                }
-                            }
+                            let mut enigo_guard = enigo.lock().await;
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Click);
                         }
                         // Double Click
                         ClientMessage::DoubleClick { button } => {
-                            unsafe {
-                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
-                                let (down_f, up_f) = match button.to_lowercase().as_str() {
-                                    "right" => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-                                    _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-                                };
-                                mouse_event(down_f, 0, 0, 0, 0);
-                                mouse_event(up_f, 0, 0, 0, 0);
-                                std::thread::sleep(Duration::from_millis(30));
-                                mouse_event(down_f, 0, 0, 0, 0);
-                                mouse_event(up_f, 0, 0, 0, 0);
-                            }
+                            let mut enigo_guard = enigo.lock().await;
+                            let btn = match button.to_lowercase().as_str() {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            let _ = enigo_guard.button(btn, Direction::Click);
+                            let _ = enigo_guard.button(btn, Direction::Click);
                         }
                         // Mouse Scroll
                         ClientMessage::Scroll { dx: _, dy } => {
                             if let Some(y) = dy {
-                                unsafe {
-                                    use windows_sys::Win32::UI::WindowsAndMessaging::*;
-                                    // In Windows, WHEEL_DELTA is 120. -y * 120 provides standard scroll direction
-                                    let delta = (-y * 120) as u32;
-                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
-                                }
+                                let mut enigo_guard = enigo.lock().await;
+                                let _ = enigo_guard.scroll(y, Axis::Vertical);
                             }
                         }
                         // Keyboard Text Typing

@@ -3,17 +3,22 @@ name = "remote_pc_host"
 version = "1.0.0"
 edition = "2021"
 authors = ["Remote PC Team"]
-description = "High-performance Windows DXGI GPU Screen Mirroring & Remote Input Server"
+description = "High-performance Windows GPU Screen Mirroring & Direct Win32 Remote Input Server"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = "0.23"
-dxgi-capture-rs = "1.2.2"
+xcap = "0.9"
 enigo = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi"
+] }
 
 [profile.release]
 opt-level = 3

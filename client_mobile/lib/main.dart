@@ -102,10 +102,13 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   double _remoteHeight = 1080;
   String _hostPcName = '';
 
-  // Control Mode: Direct Touch (like a touchscreen) vs Trackpad (laptop touchpad)
+  // Display Mode: Aspect Ratio Fit vs Full Screen Stretch
+  bool _isFitScreen = true;
+
+  // Control Mode: Direct Touch Screen vs Laptop Trackpad
   bool _isDirectTouchMode = true;
   bool _isDragLocked = false;
-  double _trackpadSensitivity = 1.35;
+  final double _trackpadSensitivity = 1.35;
 
   // Custom Websites & Shortcuts
   final List<WebShortcutItem> _webShortcuts = [
@@ -354,6 +357,13 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     final Size widgetSize = box.size;
     if (widgetSize.width <= 0 || widgetSize.height <= 0) return null;
 
+    if (!_isFitScreen) {
+      return Offset(
+        (localPosition.dx / widgetSize.width).clamp(0.0, 1.0),
+        (localPosition.dy / widgetSize.height).clamp(0.0, 1.0),
+      );
+    }
+
     final double hostAspect = _remoteWidth / _remoteHeight;
     final double viewAspect = widgetSize.width / widgetSize.height;
 
@@ -374,13 +384,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
     final double touchInsideX = localPosition.dx - offsetX;
     final double touchInsideY = localPosition.dy - offsetY;
-
-    if (touchInsideX < 0 ||
-        touchInsideX > renderedWidth ||
-        touchInsideY < 0 ||
-        touchInsideY > renderedHeight) {
-      return null;
-    }
 
     return Offset(
       (touchInsideX / renderedWidth).clamp(0.0, 1.0),
@@ -415,12 +418,12 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleDirectTouchPanStart(DragStartDetails details) {
-    final coords = _getNormalizedCoordinates(details.localPosition);
-    if (coords == null) return;
-
-    _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
-    if (_isDragLocked) {
-      _sendJson({'type': 'mouse_down', 'button': 'left'});
+    if (_isDirectTouchMode) {
+      final coords = _getNormalizedCoordinates(details.localPosition);
+      if (coords != null) {
+        _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
+        _sendJson({'type': 'mouse_down', 'button': 'left'});
+      }
     }
   }
 
@@ -431,7 +434,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
       }
     } else {
-      // Trackpad relative movement
+      // Precision Trackpad relative movement
       final dx = details.delta.dx * _trackpadSensitivity;
       final dy = details.delta.dy * _trackpadSensitivity;
       _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
@@ -439,7 +442,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleDirectTouchPanEnd(DragEndDetails details) {
-    if (_isDirectTouchMode && _isDragLocked) {
+    if (_isDirectTouchMode) {
       _sendJson({'type': 'mouse_up', 'button': 'left'});
     }
   }
@@ -810,12 +813,23 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               child: Text(_isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 12)),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
+
+          // Aspect Ratio Fit / Fill Toggle
+          IconButton(
+            onPressed: () => setState(() => _isFitScreen = !_isFitScreen),
+            icon: Icon(
+              _isFitScreen ? Icons.aspect_ratio : Icons.fullscreen,
+              color: const Color(0xFF38BDF8),
+              size: 20,
+            ),
+            tooltip: _isFitScreen ? 'Switch to Stretch Fill' : 'Switch to Aspect Ratio Fit',
+          ),
 
           // Shortcuts & Apps Sheet Trigger
           IconButton(
             onPressed: _showShortcutsAndAppsSheet,
-            icon: const Icon(Icons.rocket_launch, color: Color(0xFF38BDF8)),
+            icon: const Icon(Icons.rocket_launch, color: Color(0xFF38BDF8), size: 20),
             tooltip: 'Websites & Apps Launcher',
           ),
         ],
@@ -856,15 +870,24 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               onPanUpdate: _handleDirectTouchPanUpdate,
               onPanEnd: _handleDirectTouchPanEnd,
               child: Center(
-                child: AspectRatio(
-                  aspectRatio: _remoteWidth / _remoteHeight,
-                  child: Image.memory(
-                    _latestFrameBytes!,
-                    fit: BoxFit.contain,
-                    gaplessPlayback: true,
-                    filterQuality: FilterQuality.low,
-                  ),
-                ),
+                child: _isFitScreen
+                    ? AspectRatio(
+                        aspectRatio: _remoteWidth / _remoteHeight,
+                        child: Image.memory(
+                          _latestFrameBytes!,
+                          fit: BoxFit.contain,
+                          gaplessPlayback: true,
+                          filterQuality: FilterQuality.low,
+                        ),
+                      )
+                    : SizedBox.expand(
+                        child: Image.memory(
+                          _latestFrameBytes!,
+                          fit: BoxFit.fill,
+                          gaplessPlayback: true,
+                          filterQuality: FilterQuality.low,
+                        ),
+                      ),
               ),
             )
           : Center(
@@ -878,9 +901,17 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    _statusMessage,
+                    _isConnected ? 'Waiting for screen frames from PC...' : _statusMessage,
                     style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 14),
                   ),
+                  if (_isConnected) ...[
+                    const SizedBox(height: 12),
+                    const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF38BDF8)),
+                    ),
+                  ],
                   if (!_isConnected && !_isScanning)
                     Padding(
                       padding: const EdgeInsets.only(top: 14.0),
@@ -955,6 +986,23 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               ],
             ),
           ),
+
+          // Live stats badge
+          if (_isConnected) ...[
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E293B),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                '$_renderedFps FPS | ${_latencyMs}ms',
+                style: const TextStyle(fontSize: 10, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+
           const Spacer(),
 
           // Mouse Action Buttons
@@ -1044,7 +1092,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                // Prominent Windows Start Menu Key (Fixed!)
+                // Prominent Windows Start Menu Key
                 ElevatedButton.icon(
                   onPressed: _isConnected ? () => _sendKey('win') : null,
                   style: ElevatedButton.styleFrom(

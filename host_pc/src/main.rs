@@ -1,13 +1,13 @@
 //! Remote PC Host Server
-//! Windows DXGI Desktop Duplication Screen Mirror & Remote Input Injection
+//! High-performance Windows Screen Mirroring & Direct Win32 Remote Input Server
 //!
 //! Features:
 //! - Auto-Elevation to Administrator (UAC prompt on double-click)
 //! - Auto-Firewall Rule Configuration (Port 8765 TCP & 8766 UDP)
 //! - UDP Auto-Discovery Beacon (Mobile app discovers PC with 1 click, no typing)
-//! - DXGI Desktop Duplication 60 FPS screen capture with instant frame delivery
-//! - Touch screen & Trackpad Mouse Control (absolute & relative movement, click, drag, scroll)
-//! - Windows Key & Keyboard shortcuts (Win / Meta, Alt+Tab, Win+D, TaskMgr)
+//! - Multi-Engine Screen Capture via XCap (Hardware DXGI + Windows Graphics Capture + GDI Fallback)
+//! - Direct Win32 OS Cursor Control (SetCursorPos & mouse_event for 100% reliable mouse movement & click)
+//! - Windows Key & Keyboard shortcuts (Win / Meta Start Menu, Alt+Tab, Win+D, TaskMgr)
 //! - Web Shortcut Launcher (opens sites on PC default browser)
 //! - Desktop App Launcher (opens apps & shortcuts on PC)
 
@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dxgi_capture_rs::DXGIManager;
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ColorType;
@@ -349,7 +348,7 @@ fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
 async fn main() -> Result<(), Box<dyn Error>> {
     // 1. Automatic UAC Elevation: If not admin, prompt Windows UAC elevation automatically
     if !is_running_as_admin() {
-        println!("[UAC] Requesting Administrator privileges for DXGI capture and Firewall setup...");
+        println!("[UAC] Requesting Administrator privileges for screen capture and Firewall setup...");
         relaunch_as_admin();
     }
 
@@ -380,29 +379,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("      or enter: {}:8765", local_lan_ip);
     println!("------------------------------------------------------------");
 
+    // Detect actual physical screen metrics via Windows user32 API
+    let sys_screen_w = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+        )
+    };
+    let sys_screen_h = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+        )
+    };
+    let initial_w = if sys_screen_w > 0 { sys_screen_w as usize } else { 1920 };
+    let initial_h = if sys_screen_h > 0 { sys_screen_h as usize } else { 1080 };
+    println!("[DISPLAY] Detected Primary Screen: {}x{}", initial_w, initial_h);
+
+    let screen_width = Arc::new(AtomicUsize::new(initial_w));
+    let screen_height = Arc::new(AtomicUsize::new(initial_h));
+
     // Broadcast channel for distributing compressed JPEG frames
     let (frame_tx, _) = broadcast::channel::<FrameData>(16);
-
-    let screen_width = Arc::new(AtomicUsize::new(1920));
-    let screen_height = Arc::new(AtomicUsize::new(1080));
     let latest_jpeg = Arc::new(RwLock::new(Vec::new()));
 
-    // Shared thread-safe input injector
+    // Shared thread-safe input injector for keyboard text
     let enigo = Arc::new(Mutex::new(
         Enigo::new(&Settings::default()).expect("Failed to initialize Enigo input injector"),
     ));
 
-    // Force an initial tiny mouse nudge so DXGI generates a frame immediately on start
-    {
-        if let Ok(mut enigo_init) = Enigo::new(&Settings::default()) {
-            let _ = enigo_init.move_mouse(1, 0, Coordinate::Rel);
-            let _ = enigo_init.move_mouse(-1, 0, Coordinate::Rel);
-        }
-    }
-
     let is_running = Arc::new(AtomicBool::new(true));
 
-    // Spawn DXGI Screen Capture Task on dedicated OS thread
+    // Spawn Multi-Engine Screen Capture Task on dedicated OS thread
     let capture_tx = frame_tx.clone();
     let capture_running = is_running.clone();
     let width_ref = screen_width.clone();
@@ -410,48 +416,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_latest = latest_jpeg.clone();
 
     std::thread::spawn(move || {
-        println!("[DXGI] Initializing Windows DXGI Desktop Duplication API...");
-        let mut manager = match DXGIManager::new(100) {
-            Ok(mgr) => {
-                println!("[DXGI] Successfully attached to primary GPU output adapter.");
-                mgr
-            }
-            Err(e) => {
-                eprintln!("[DXGI] DXGI initialization failed: {:?}. Retrying...", e);
-                std::thread::sleep(Duration::from_secs(1));
-                DXGIManager::new(100).expect("Fatal: Could not initialize DXGI Output Duplication")
-            }
-        };
-
+        println!("[CAPTURE] Initializing Screen Capture Engine (XCap)...");
+        
         let target_frame_duration = Duration::from_millis(16);
         let mut last_valid_jpeg = Arc::new(Vec::new());
 
         while capture_running.load(Ordering::Relaxed) {
             let start_time = Instant::now();
 
-            match manager.capture_frame_components() {
-                Ok((mut pixels, (width, height))) => {
-                    width_ref.store(width, Ordering::Relaxed);
-                    height_ref.store(height, Ordering::Relaxed);
+            let monitors = match xcap::Monitor::all() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[CAPTURE] Monitor detection error: {:?}", e);
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
 
-                    // pixels is Vec<u8> (BGRA raw byte components)
-                    // Swizzle B and R in-place to RGBA for accurate JPEG color
-                    for chunk in pixels.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
+            if monitors.is_empty() {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
 
-                    // Compress to JPEG (quality 70 offers optimal size/speed tradeoff)
-                    let mut jpeg_buffer = Vec::with_capacity((width * height) / 4);
-                    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buffer, 70);
-                    if let Ok(()) = encoder.encode(
-                        &pixels,
-                        width as u32,
-                        height as u32,
-                        ColorType::Rgba8.into(),
-                    ) {
+            // Find primary monitor, or default to first monitor
+            let primary_idx = monitors.iter().position(|m| m.is_primary()).unwrap_or(0);
+            let monitor = &monitors[primary_idx];
+
+            match monitor.capture_image() {
+                Ok(rgba_img) => {
+                    let width = rgba_img.width();
+                    let height = rgba_img.height();
+                    width_ref.store(width as usize, Ordering::Relaxed);
+                    height_ref.store(height as usize, Ordering::Relaxed);
+
+                    // Compress frame to high-quality JPEG
+                    let mut jpeg_buffer = Vec::with_capacity((width * height / 4) as usize);
+                    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buffer, 65);
+                    if encoder
+                        .encode(rgba_img.as_raw(), width, height, ColorType::Rgba8.into())
+                        .is_ok()
+                    {
                         last_valid_jpeg = Arc::new(jpeg_buffer.clone());
 
-                        // Cache latest frame for instantaneous delivery to new client connections
+                        // Cache newest frame for instant delivery to new client connections
                         {
                             let mut guard = capture_latest.blocking_write();
                             *guard = jpeg_buffer;
@@ -459,14 +466,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         let frame = FrameData {
                             jpeg_bytes: last_valid_jpeg.clone(),
-                            width: width as u32,
-                            height: height as u32,
+                            width,
+                            height,
                         };
                         let _ = capture_tx.send(frame);
                     }
                 }
-                Err(_) => {
-                    // Screen has not changed (DXGI Timeout) - periodically refresh last frame
+                Err(e) => {
+                    // In case of momentary capture lock, resend last valid frame
                     if !last_valid_jpeg.is_empty() {
                         let frame = FrameData {
                             jpeg_bytes: last_valid_jpeg.clone(),
@@ -474,6 +481,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             height: height_ref.load(Ordering::Relaxed) as u32,
                         };
                         let _ = capture_tx.send(frame);
+                    } else {
+                        eprintln!("[CAPTURE] Frame capture note: {:?}", e);
                     }
                 }
             }
@@ -606,70 +615,107 @@ async fn handle_connection(
         match msg_result {
             Ok(Message::Text(text)) => {
                 if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
-                    let mut enigo_guard = enigo.lock().await;
                     let cur_w = screen_width.load(Ordering::Relaxed) as f64;
                     let cur_h = screen_height.load(Ordering::Relaxed) as f64;
 
                     match cmd {
-                        // Direct Touch Screen / Absolute Mouse Positioning
+                        // Direct Touch Screen / Absolute Mouse Positioning via Windows user32 SetCursorPos
                         ClientMessage::Move { x, y } => {
                             let clamped_x = (x.clamp(0.0, 1.0) * cur_w) as i32;
                             let clamped_y = (y.clamp(0.0, 1.0) * cur_h) as i32;
-                            let _ = enigo_guard.move_mouse(clamped_x, clamped_y, Coordinate::Abs);
+                            unsafe {
+                                windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
+                                    clamped_x, clamped_y,
+                                );
+                            }
                         }
-                        // Laptop Trackpad / Relative Mouse Movement
+                        // Laptop Trackpad / Relative Mouse Movement via Windows mouse_event
                         ClientMessage::MoveRelative { dx, dy } => {
-                            let _ = enigo_guard.move_mouse(dx as i32, dy as i32, Coordinate::Rel);
+                            unsafe {
+                                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                                    mouse_event, MOUSEEVENTF_MOVE,
+                                };
+                                mouse_event(MOUSEEVENTF_MOVE, dx as i32, dy as i32, 0, 0);
+                            }
                         }
                         // Mouse Press / Dragging
                         ClientMessage::MouseDown { button } => {
-                            let btn = match button.to_lowercase().as_str() {
-                                "right" => Button::Right,
-                                "middle" => Button::Middle,
-                                _ => Button::Left,
-                            };
-                            let _ = enigo_guard.button(btn, Direction::Press);
+                            unsafe {
+                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                                let flag = match button.to_lowercase().as_str() {
+                                    "right" => MOUSEEVENTF_RIGHTDOWN,
+                                    "middle" => MOUSEEVENTF_MIDDLEDOWN,
+                                    _ => MOUSEEVENTF_LEFTDOWN,
+                                };
+                                mouse_event(flag, 0, 0, 0, 0);
+                            }
                         }
                         // Mouse Release
                         ClientMessage::MouseUp { button } => {
-                            let btn = match button.to_lowercase().as_str() {
-                                "right" => Button::Right,
-                                "middle" => Button::Middle,
-                                _ => Button::Left,
-                            };
-                            let _ = enigo_guard.button(btn, Direction::Release);
+                            unsafe {
+                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                                let flag = match button.to_lowercase().as_str() {
+                                    "right" => MOUSEEVENTF_RIGHTUP,
+                                    "middle" => MOUSEEVENTF_MIDDLEUP,
+                                    _ => MOUSEEVENTF_LEFTUP,
+                                };
+                                mouse_event(flag, 0, 0, 0, 0);
+                            }
                         }
                         // Mouse Click
                         ClientMessage::Click { button } => {
-                            let btn = match button.to_lowercase().as_str() {
-                                "right" => Button::Right,
-                                "middle" => Button::Middle,
-                                _ => Button::Left,
-                            };
-                            let _ = enigo_guard.button(btn, Direction::Click);
+                            unsafe {
+                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                                match button.to_lowercase().as_str() {
+                                    "right" => {
+                                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                                        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                                    }
+                                    "middle" => {
+                                        mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
+                                        mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
+                                    }
+                                    _ => {
+                                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                                    }
+                                }
+                            }
                         }
                         // Double Click
                         ClientMessage::DoubleClick { button } => {
-                            let btn = match button.to_lowercase().as_str() {
-                                "right" => Button::Right,
-                                "middle" => Button::Middle,
-                                _ => Button::Left,
-                            };
-                            let _ = enigo_guard.button(btn, Direction::Click);
-                            let _ = enigo_guard.button(btn, Direction::Click);
+                            unsafe {
+                                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                                let (down_f, up_f) = match button.to_lowercase().as_str() {
+                                    "right" => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                                    _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                                };
+                                mouse_event(down_f, 0, 0, 0, 0);
+                                mouse_event(up_f, 0, 0, 0, 0);
+                                std::thread::sleep(Duration::from_millis(30));
+                                mouse_event(down_f, 0, 0, 0, 0);
+                                mouse_event(up_f, 0, 0, 0, 0);
+                            }
                         }
                         // Mouse Scroll
                         ClientMessage::Scroll { dx: _, dy } => {
                             if let Some(y) = dy {
-                                let _ = enigo_guard.scroll(y, Axis::Vertical);
+                                unsafe {
+                                    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                                    // In Windows, WHEEL_DELTA is 120. -y * 120 provides standard scroll direction
+                                    let delta = (-y * 120) as u32;
+                                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+                                }
                             }
                         }
                         // Keyboard Text Typing
                         ClientMessage::Type { text } => {
+                            let mut enigo_guard = enigo.lock().await;
                             let _ = enigo_guard.text(&text);
                         }
                         // Keyboard Key and Windows Key Actions
                         ClientMessage::Key { key } => {
+                            let mut enigo_guard = enigo.lock().await;
                             let lower = key.to_lowercase();
                             match lower.as_str() {
                                 // Windows Start Menu key (triggers VK_LWIN + Ctrl+Esc for 100% reliability)

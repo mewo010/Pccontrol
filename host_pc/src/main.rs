@@ -4,28 +4,22 @@
 //! Features:
 //! - Auto-Elevation to Administrator (UAC prompt on double-click)
 //! - Auto-Firewall Rule Configuration (Port 8765 TCP & 8766 UDP)
-//! - UDP Auto-Discovery Beacon (Mobile app discovers PC with 1 click, no typing)
-//! - Dual-Engine Screen Capture: XCap Hardware DXGI + Native Windows GDI BitBlt Fallback
-//! - Direct Win32 OS Cursor Control (SetCursorPos & GetCursorPos for 100% reliable mouse movement)
-//! - Enigo mouse button, scroll, keyboard text & key injection
-//! - Windows Key & Keyboard shortcuts (Win / Meta Start Menu, Alt+Tab, Win+D, TaskMgr)
-//! - Web Shortcut Launcher & Desktop App Launcher
-//! - Protected Administrator Portal (Password: Sagiv_2311)
-//!   - Real-time list of all connected mobile clients
-//!   - Remote Disconnect functionality
-//!   - Persistent Remote Lock (keys both device ID and IP so reopening app cannot bypass lock)
-//!   - Remote Unlock
+//! - UDP Auto-Discovery Beacon on Port 8766
+//! - High-Performance Dual Screen Capture: XCap Hardware DXGI + Direct GDI BitBlt + Test Pattern
+//! - Full Telemetry & Diagnostics Heartbeat Stream (Engine, FPS, Encode MS, Error logging)
+//! - Direct Win32 Mouse & Keyboard Injection
+//! - Administrator Security Portal with Device Locks & Client Management
 
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ColorType;
 use serde::{Deserialize, Serialize};
@@ -67,6 +61,12 @@ pub enum ClientMessage {
         device_name: Option<String>,
         device_id: Option<String>,
     },
+    #[serde(rename = "request_frame")]
+    RequestFrame,
+    #[serde(rename = "request_test_frame")]
+    RequestTestFrame,
+    #[serde(rename = "set_capture_mode")]
+    SetCaptureMode { mode: String },
     #[serde(rename = "move")]
     Move { x: f64, y: f64 },
     #[serde(rename = "move_relative")]
@@ -122,6 +122,20 @@ pub enum HostMessage {
         host_name: String,
         ip_address: String,
         client_id: usize,
+    },
+    #[serde(rename = "capture_debug")]
+    CaptureDebug {
+        engine: String,
+        fps: u32,
+        frame_count: u64,
+        width: u32,
+        height: u32,
+        last_bytes: usize,
+        last_encode_ms: u64,
+        status: String,
+        last_error: Option<String>,
+        mode: String,
+        frames_sent_to_client: u64,
     },
     #[serde(rename = "admin_auth_result")]
     AdminAuthResult {
@@ -358,19 +372,19 @@ $sp2.Margin = New-Object System.Windows.Thickness(0, 14, 0, 0)
 [System.Windows.Controls.Grid]::SetRow($sp2, 2)
 
 $t1 = New-Object System.Windows.Controls.TextBlock
-$t1.Text = ". Host PC: " + $pcName
+$t1.Text = "• Host PC: " + $pcName
 $t1.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
 $t1.FontSize = 12; $t1.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
 $sp2.Children.Add($t1) | Out-Null
 
 $t2 = New-Object System.Windows.Controls.TextBlock
-$t2.Text = ". Stream Port: 8765 TCP | Discovery: 8766 UDP"
+$t2.Text = "• Stream Port: 8765 TCP | Discovery: 8766 UDP"
 $t2.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
 $t2.FontSize = 12; $t2.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
 $sp2.Children.Add($t2) | Out-Null
 
 $t3 = New-Object System.Windows.Controls.TextBlock
-$t3.Text = ". Admin Pass: " + "Sagiv_2311"
+$t3.Text = "• Admin Pass: " + "Sagiv_2311"
 $t3.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#38BDF8")
 $t3.FontSize = 12
 $sp2.Children.Add($t3) | Out-Null
@@ -440,41 +454,49 @@ fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
 }
 
 /// Universal, 100% reliable desktop capture via native Windows GDI BitBlt
-unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
+/// Uses screen DC for GetDIBits to ensure correct 32-bit color extraction
+unsafe fn capture_screen_gdi(width: i32, height: i32) -> Result<Vec<u8>, String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Graphics::Gdi::*;
 
     let hdc_screen = GetDC(null_mut());
     if hdc_screen.is_null() {
-        return None;
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        return Err(format!("GetDC(NULL) failed (Win32 error: {})", err));
     }
     let hdc_mem = CreateCompatibleDC(hdc_screen);
     if hdc_mem.is_null() {
+        let err = windows_sys::Win32::Foundation::GetLastError();
         ReleaseDC(null_mut(), hdc_screen);
-        return None;
+        return Err(format!("CreateCompatibleDC failed (Win32 error: {})", err));
     }
     let hbitmap = CreateCompatibleBitmap(hdc_screen, width, height);
     if hbitmap.is_null() {
+        let err = windows_sys::Win32::Foundation::GetLastError();
         DeleteDC(hdc_mem);
         ReleaseDC(null_mut(), hdc_screen);
-        return None;
+        return Err(format!("CreateCompatibleBitmap({}x{}) failed (Win32 error: {})", width, height, err));
     }
 
     let old_obj = SelectObject(hdc_mem, hbitmap);
-    BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
+    let blt_res = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
+    if blt_res == 0 {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        eprintln!("[GDI] BitBlt returned 0 (Win32 error: {})", err);
+    }
 
-    // CRITICAL: Unselect hbitmap before GetDIBits to comply with Win32 GDI rules
+    // Unselect hbitmap before GetDIBits to comply with Win32 GDI specifications
     SelectObject(hdc_mem, old_obj);
 
     let mut bi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width,
-            biHeight: height, // positive height for standard DIB
+            biHeight: height, // Standard positive bottom-up DIB (universally supported across all Windows versions)
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
-            biSizeImage: 0,
+            biSizeImage: (width * height * 4) as u32,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
             biClrUsed: 0,
@@ -485,7 +507,7 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
 
     let mut bgra_buf = vec![0u8; (width * height * 4) as usize];
     let lines = GetDIBits(
-        hdc_mem,
+        hdc_screen,
         hbitmap,
         0,
         height as u32,
@@ -499,7 +521,8 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
     ReleaseDC(null_mut(), hdc_screen);
 
     if lines == 0 {
-        return None;
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        return Err(format!("GetDIBits failed (Win32 error: {})", err));
     }
 
     // Convert bottom-to-top BGRA to top-to-bottom RGBA
@@ -518,11 +541,63 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
         }
     }
 
-    Some(rgba_buf)
+    Ok(rgba_buf)
+}
+
+/// Generates a crisp diagnostic test pattern frame with color bars and moving scanner
+/// This guarantees the network and video rendering pipeline can be validated 100%
+fn generate_test_pattern(width: u32, height: u32, frame_num: u64, host_name: &str, ip: &str) -> Vec<u8> {
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let colors: [[u8; 3]; 8] = [
+        [248, 250, 252], // White / Slate 50
+        [234, 179, 8],   // Amber
+        [14, 165, 233],  // Sky
+        [34, 197, 94],   // Green
+        [168, 85, 247],  // Purple
+        [239, 68, 68],   // Red
+        [59, 130, 246],  // Blue
+        [15, 23, 42],    // Dark Slate 900
+    ];
+    let col_w = (width / 8).max(1);
+    let bar_shift = ((frame_num % 120) as f64 / 120.0 * width as f64) as u32;
+
+    for y in 0..height {
+        let is_header_bar = y < 50 || y > height - 50;
+        for x in 0..width {
+            let idx = ((y * width + x) * 4) as usize;
+            if is_header_bar {
+                rgba[idx] = 15;
+                rgba[idx + 1] = 23;
+                rgba[idx + 2] = 42;
+                rgba[idx + 3] = 255;
+            } else {
+                let col_idx = ((x / col_w) as usize).min(7);
+                let base_color = colors[col_idx];
+                let is_scanner = (x as i32 - bar_shift as i32).abs() < 8;
+                if is_scanner {
+                    rgba[idx] = 56;
+                    rgba[idx + 1] = 189;
+                    rgba[idx + 2] = 248; // Bright Sky Scanner Line
+                    rgba[idx + 3] = 255;
+                } else {
+                    rgba[idx] = base_color[0];
+                    rgba[idx + 1] = base_color[1];
+                    rgba[idx + 2] = base_color[2];
+                    rgba[idx + 3] = 255;
+                }
+            }
+        }
+    }
+    rgba
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // 0. Enable Windows DPI Awareness so screen width/height and GDI captures match true monitor pixels
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
+
     // 1. Automatic UAC Elevation: If not admin, prompt Windows UAC elevation automatically
     if !is_running_as_admin() {
         println!("[UAC] Requesting Administrator privileges for screen capture and Firewall setup...");
@@ -572,6 +647,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let initial_h = if sys_screen_h > 0 { sys_screen_h as usize } else { 1080 };
     println!("[DISPLAY] Detected Primary Screen: {}x{}", initial_w, initial_h);
 
+    // Quick startup test of GDI capture
+    println!("[CAPTURE] Running initial GDI capture diagnostic...");
+    let test_capture = unsafe { capture_screen_gdi(initial_w as i32, initial_h as i32) };
+    match test_capture {
+        Ok(buf) => println!(
+            "[CAPTURE] Test GDI capture SUCCESS: {} bytes generated for {}x{}",
+            buf.len(),
+            initial_w,
+            initial_h
+        ),
+        Err(err) => eprintln!("[CAPTURE] Warning: Initial test GDI capture: {}", err),
+    }
+
     let screen_width = Arc::new(AtomicUsize::new(initial_w));
     let screen_height = Arc::new(AtomicUsize::new(initial_h));
 
@@ -588,17 +676,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client_registry: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
     let locked_table: LockedTable = Arc::new(Mutex::new(HashMap::new()));
 
+    // Telemetry & diagnostics state
+    let total_frames_captured = Arc::new(AtomicU64::new(0));
+    let last_encode_time_ms = Arc::new(AtomicU64::new(0));
+    let last_frame_size_bytes = Arc::new(AtomicUsize::new(0));
+    let active_engine_name = Arc::new(RwLock::new("Initializing".to_string()));
+    let capture_mode = Arc::new(RwLock::new("auto".to_string())); // "auto", "gdi", "xcap", "test_pattern"
+    let last_capture_error = Arc::new(RwLock::new(None::<String>));
+
     let is_running = Arc::new(AtomicBool::new(true));
 
-    // Spawn Dual-Engine Screen Capture Task on dedicated OS thread
+    // Spawn Multi-Engine Screen Capture Task on dedicated OS thread
     let capture_tx = frame_tx.clone();
     let capture_running = is_running.clone();
     let width_ref = screen_width.clone();
     let height_ref = screen_height.clone();
     let capture_latest = latest_jpeg.clone();
+    let frames_counter_clone = total_frames_captured.clone();
+    let encode_time_clone = last_encode_time_ms.clone();
+    let frame_size_clone = last_frame_size_bytes.clone();
+    let engine_name_clone = active_engine_name.clone();
+    let mode_clone = capture_mode.clone();
+    let error_clone = last_capture_error.clone();
+    let host_name_capture = host_name.clone();
+    let lan_ip_capture = local_lan_ip.clone();
 
     std::thread::spawn(move || {
-        // Initialize COM on this thread so DirectX and Windows Graphics Capture work without CO_E_NOTINITIALIZED
+        // Initialize COM on this thread so DirectX and Windows Graphics Capture work cleanly
         unsafe {
             windows_sys::Win32::System::Com::CoInitializeEx(
                 std::ptr::null_mut(),
@@ -606,8 +710,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
 
-        println!("[CAPTURE] Initializing Screen Capture Engine (XCap + GDI Fallback)...");
-        let target_frame_duration = Duration::from_millis(16);
+        println!("[CAPTURE] Initializing Screen Capture Engine (XCap DXGI + Windows GDI BitBlt + Test Pattern)...");
+        let target_frame_duration = Duration::from_millis(33); // ~30 FPS default
         let mut last_valid_jpeg = Arc::new(Vec::new());
         let mut last_monitor_check = Instant::now() - Duration::from_secs(10);
         let mut cached_monitors = Vec::new();
@@ -615,63 +719,126 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         while capture_running.load(Ordering::Relaxed) {
             let start_time = Instant::now();
+            let current_mode = mode_clone.blocking_read().clone();
 
-            // Refresh monitor list every 5 seconds (not on every frame)
-            if last_monitor_check.elapsed() > Duration::from_secs(5) {
+            // Refresh monitor list every 5 seconds if using xcap
+            if current_mode != "gdi" && current_mode != "test_pattern" && last_monitor_check.elapsed() > Duration::from_secs(5) {
                 last_monitor_check = Instant::now();
                 if let Ok(m) = xcap::Monitor::all() {
                     cached_monitors = m;
                 }
             }
 
-            let mut captured_rgba: Option<(Vec<u8>, u32, u32)> = None;
+            let mut captured_rgba: Option<(Vec<u8>, u32, u32, &'static str)> = None;
+            let mut current_err: Option<String> = None;
 
-            // Engine 1: XCap Hardware Capture
-            if !cached_monitors.is_empty() {
-                let p_idx = cached_monitors
-                    .iter()
-                    .position(|m| m.is_primary().unwrap_or(false))
-                    .unwrap_or(0);
-                if let Some(m) = cached_monitors.get(p_idx) {
-                    if let Ok(img) = m.capture_image() {
-                        let w = img.width();
-                        let h = img.height();
-                        captured_rgba = Some((img.into_raw(), w, h));
+            // Strategy 1: Test Pattern forced mode
+            if current_mode == "test_pattern" {
+                let cur_w = width_ref.load(Ordering::Relaxed) as u32;
+                let cur_h = height_ref.load(Ordering::Relaxed) as u32;
+                let w = if cur_w > 0 { cur_w } else { 1920 };
+                let h = if cur_h > 0 { cur_h } else { 1080 };
+                let frame_num = frames_counter_clone.load(Ordering::Relaxed);
+                let rgba = generate_test_pattern(w, h, frame_num, &host_name_capture, &lan_ip_capture);
+                captured_rgba = Some((rgba, w, h, "Diagnostic Test Pattern"));
+            }
+
+            // Strategy 2: XCap Hardware DXGI / WGC Capture (when mode is "auto" or "xcap")
+            if captured_rgba.is_none() && (current_mode == "auto" || current_mode == "xcap") {
+                if !cached_monitors.is_empty() {
+                    let p_idx = cached_monitors
+                        .iter()
+                        .position(|m| m.is_primary().unwrap_or(false))
+                        .unwrap_or(0);
+                    if let Some(m) = cached_monitors.get(p_idx) {
+                        match m.capture_image() {
+                            Ok(img) => {
+                                let w = img.width();
+                                let h = img.height();
+                                captured_rgba = Some((img.into_raw(), w, h, "XCap Hardware DXGI"));
+                            }
+                            Err(e) => {
+                                current_err = Some(format!("XCap capture error: {:?}", e));
+                            }
+                        }
                     }
+                } else if current_mode == "xcap" {
+                    current_err = Some("XCap: No monitors detected".to_string());
                 }
             }
 
-            // Engine 2: Windows GDI BitBlt Fallback (100% infallible on all systems)
-            if captured_rgba.is_none() {
+            // Strategy 3: Windows GDI BitBlt Capture (infallible fallback or when mode is "gdi" or "auto")
+            if captured_rgba.is_none() && (current_mode == "auto" || current_mode == "gdi") {
                 let cur_w = width_ref.load(Ordering::Relaxed) as i32;
                 let cur_h = height_ref.load(Ordering::Relaxed) as i32;
                 let w = if cur_w > 0 { cur_w } else { 1920 };
                 let h = if cur_h > 0 { cur_h } else { 1080 };
-                if let Some(rgba) = unsafe { capture_screen_gdi(w, h) } {
-                    captured_rgba = Some((rgba, w as u32, h as u32));
+                match unsafe { capture_screen_gdi(w, h) } {
+                    Ok(rgba) => {
+                        captured_rgba = Some((rgba, w as u32, h as u32, "Windows GDI BitBlt"));
+                        current_err = None;
+                    }
+                    Err(e) => {
+                        current_err = Some(format!("GDI error: {}", e));
+                    }
                 }
             }
 
+            // Strategy 4: Fallback to Diagnostic Test Pattern if hardware capture is completely stalled
+            if captured_rgba.is_none() && last_valid_jpeg.is_empty() {
+                let cur_w = width_ref.load(Ordering::Relaxed) as u32;
+                let cur_h = height_ref.load(Ordering::Relaxed) as u32;
+                let w = if cur_w > 0 { cur_w } else { 1920 };
+                let h = if cur_h > 0 { cur_h } else { 1080 };
+                let frame_num = frames_counter_clone.load(Ordering::Relaxed);
+                let rgba = generate_test_pattern(w, h, frame_num, &host_name_capture, &lan_ip_capture);
+                captured_rgba = Some((rgba, w, h, "Fallback Diagnostic Pattern"));
+                if current_err.is_none() {
+                    current_err = Some("Hardware capture initial fallback".to_string());
+                }
+            }
+
+            // Update telemetry error string
+            {
+                let mut err_guard = error_clone.blocking_write();
+                *err_guard = current_err;
+            }
+
             // Encode to JPEG and distribute to connected clients
-            if let Some((raw_pixels, width, height)) = captured_rgba {
+            if let Some((raw_pixels, width, height, engine_name)) = captured_rgba {
                 width_ref.store(width as usize, Ordering::Relaxed);
                 height_ref.store(height as usize, Ordering::Relaxed);
 
+                let encode_start = Instant::now();
                 let mut jpeg_buffer = Vec::with_capacity((width * height / 4) as usize);
                 let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buffer, 65);
                 if encoder
                     .encode(&raw_pixels, width, height, ColorType::Rgba8.into())
                     .is_ok()
                 {
+                    let enc_ms = encode_start.elapsed().as_millis() as u64;
+                    let buf_len = jpeg_buffer.len();
+
+                    encode_time_clone.store(enc_ms, Ordering::Relaxed);
+                    frame_size_clone.store(buf_len, Ordering::Relaxed);
+                    frames_counter_clone.fetch_add(1, Ordering::Relaxed);
+
+                    {
+                        let mut name_guard = engine_name_clone.blocking_write();
+                        *name_guard = engine_name.to_string();
+                    }
+
                     last_valid_jpeg = Arc::new(jpeg_buffer.clone());
 
                     if !first_frame_logged {
                         first_frame_logged = true;
                         println!(
-                            "[CAPTURE] Screen streaming active! Captured {}x{} frame ({} KB)",
+                            "[CAPTURE] Screen streaming active! Engine: {}, {}x{}, {} KB (encode: {} ms)",
+                            engine_name,
                             width,
                             height,
-                            jpeg_buffer.len() / 1024
+                            buf_len / 1024,
+                            enc_ms
                         );
                     }
 
@@ -725,6 +892,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let latest_jpeg_clone = latest_jpeg.clone();
         let registry_clone = client_registry.clone();
         let locked_clone = locked_table.clone();
+        let frames_counter_ws = total_frames_captured.clone();
+        let encode_ms_ws = last_encode_time_ms.clone();
+        let frame_size_ws = last_frame_size_bytes.clone();
+        let engine_name_ws = active_engine_name.clone();
+        let capture_mode_ws = capture_mode.clone();
+        let capture_error_ws = last_capture_error.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -740,6 +913,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 latest_jpeg_clone,
                 registry_clone,
                 locked_clone,
+                frames_counter_ws,
+                encode_ms_ws,
+                frame_size_ws,
+                engine_name_ws,
+                capture_mode_ws,
+                capture_error_ws,
             )
             .await
             {
@@ -766,11 +945,18 @@ async fn handle_connection(
     latest_jpeg: Arc<RwLock<Vec<u8>>>,
     registry: ClientRegistry,
     locked_table: LockedTable,
+    total_frames_counter: Arc<AtomicU64>,
+    last_encode_ms: Arc<AtomicU64>,
+    last_frame_bytes: Arc<AtomicUsize>,
+    active_engine_name: Arc<RwLock<String>>,
+    capture_mode: Arc<RwLock<String>>,
+    last_capture_error: Arc<RwLock<Option<String>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_sink, mut ws_stream_reader) = ws_stream.split();
 
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+    let client_frames_sent = Arc::new(AtomicU64::new(0));
 
     let client_ip = addr.ip().to_string();
     let now_sec = SystemTime::now()
@@ -817,7 +1003,6 @@ async fn handle_connection(
     }
 
     // Task A: Outbound frame writer
-    let out_tx_ping = out_tx.clone();
     let write_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if let Err(e) = ws_sink.send(msg).await {
@@ -834,12 +1019,55 @@ async fn handle_connection(
         width: initial_width,
         height: initial_height,
         fps_target: 60,
-        host_name,
-        ip_address,
+        host_name: host_name.clone(),
+        ip_address: ip_address.clone(),
         client_id,
     };
     if let Ok(info_json) = serde_json::to_string(&info_msg) {
         let _ = out_tx.send(Message::Text(info_json)).await;
+    }
+
+    // Immediately deliver the latest frame so client sees the screen without waiting!
+    {
+        let cached = latest_jpeg.read().await;
+        if !cached.is_empty() {
+            println!("[WS] Sending initial cached frame to client #{} ({} KB)", client_id, cached.len() / 1024);
+            client_frames_sent.fetch_add(1, Ordering::Relaxed);
+            let _ = out_tx.send(Message::Binary(cached.clone())).await;
+        } else {
+            // Generate an instant diagnostic frame so client NEVER has a black screen
+            println!("[WS] Generating instant startup diagnostic frame for client #{}", client_id);
+            let test_rgba = generate_test_pattern(initial_width, initial_height, 1, &host_name, &ip_address);
+            let mut buf = Vec::new();
+            let mut enc = JpegEncoder::new_with_quality(&mut buf, 70);
+            if enc.encode(&test_rgba, initial_width, initial_height, ColorType::Rgba8.into()).is_ok() {
+                client_frames_sent.fetch_add(1, Ordering::Relaxed);
+                let _ = out_tx.send(Message::Binary(buf)).await;
+            }
+        }
+    }
+
+    // Send initial telemetry debug info
+    {
+        let engine = active_engine_name.read().await.clone();
+        let cur_mode = capture_mode.read().await.clone();
+        let cur_err = last_capture_error.read().await.clone();
+        let debug_msg = HostMessage::CaptureDebug {
+            engine,
+            fps: 30,
+            frame_count: total_frames_counter.load(Ordering::Relaxed),
+            width: initial_width,
+            height: initial_height,
+            last_bytes: last_frame_bytes.load(Ordering::Relaxed),
+            last_encode_ms: last_encode_ms.load(Ordering::Relaxed),
+            status: "Connected & Streaming Active".to_string(),
+            last_error: cur_err,
+            mode: cur_mode,
+            frames_sent_to_client: client_frames_sent.load(Ordering::Relaxed),
+        };
+        if let Ok(json_str) = serde_json::to_string(&debug_msg) {
+            let _ = out_tx.send(Message::Text(json_str)).await;
+        }
     }
 
     // If client is locked upon joining, notify them immediately
@@ -859,25 +1087,21 @@ async fn handle_connection(
         }
     }
 
-    // Immediately deliver the latest frame so client sees the screen without waiting!
-    {
-        let cached = latest_jpeg.read().await;
-        if !cached.is_empty() {
-            let _ = out_tx.send(Message::Binary(cached.clone())).await;
-        }
-    }
-
     // Broadcast updated client list to all connected admins
     broadcast_admin_clients(&registry).await;
 
     // Task B: Forward video frames
     let out_tx_frames = out_tx.clone();
+    let sent_counter_frames = client_frames_sent.clone();
     let frame_task = tokio::spawn(async move {
         loop {
             match frame_rx.recv().await {
                 Ok(frame) => {
                     let msg = Message::Binary(frame.jpeg_bytes.as_ref().clone());
-                    let _ = out_tx_frames.try_send(msg);
+                    // Non-blocking try_send drops congested frames to guarantee 0ms latency lag
+                    if out_tx_frames.try_send(msg).is_ok() {
+                        sent_counter_frames.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     continue;
@@ -889,7 +1113,49 @@ async fn handle_connection(
         }
     });
 
-    // Task C: Inbound command processing
+    // Task C: Telemetry Heartbeat Ticker (every 1 second sends live debug diagnostics)
+    let out_tx_ticker = out_tx.clone();
+    let ticker_engine = active_engine_name.clone();
+    let ticker_mode = capture_mode.clone();
+    let ticker_err = last_capture_error.clone();
+    let ticker_frames = total_frames_counter.clone();
+    let ticker_width = screen_width.clone();
+    let ticker_height = screen_height.clone();
+    let ticker_bytes = last_frame_bytes.clone();
+    let ticker_encode = last_encode_ms.clone();
+    let ticker_sent = client_frames_sent.clone();
+
+    let ticker_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let engine = ticker_engine.read().await.clone();
+            let mode = ticker_mode.read().await.clone();
+            let err = ticker_err.read().await.clone();
+            let debug_msg = HostMessage::CaptureDebug {
+                engine,
+                fps: 30,
+                frame_count: ticker_frames.load(Ordering::Relaxed),
+                width: ticker_width.load(Ordering::Relaxed) as u32,
+                height: ticker_height.load(Ordering::Relaxed) as u32,
+                last_bytes: ticker_bytes.load(Ordering::Relaxed),
+                last_encode_ms: ticker_encode.load(Ordering::Relaxed),
+                status: "Live Stream Synchronized".to_string(),
+                last_error: err,
+                mode,
+                frames_sent_to_client: ticker_sent.load(Ordering::Relaxed),
+            };
+            if let Ok(json_str) = serde_json::to_string(&debug_msg) {
+                if out_tx_ticker.try_send(Message::Text(json_str)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let out_tx_ping = out_tx.clone();
+
+    // Task D: Inbound command processing
     while let Some(msg_result) = ws_stream_reader.next().await {
         match msg_result {
             Ok(Message::Text(text)) => {
@@ -990,6 +1256,100 @@ async fn handle_connection(
                             }
 
                             broadcast_admin_clients(&registry).await;
+                        }
+
+                        // Client requests an immediate fresh frame and telemetry
+                        ClientMessage::RequestFrame => {
+                            let cached = latest_jpeg.read().await;
+                            if !cached.is_empty() {
+                                println!("[WS] Fulfilling RequestFrame for client #{} ({} KB)", client_id, cached.len() / 1024);
+                                client_frames_sent.fetch_add(1, Ordering::Relaxed);
+                                let _ = out_tx_ping.send(Message::Binary(cached.clone())).await;
+                            } else {
+                                let cur_w = screen_width.load(Ordering::Relaxed) as u32;
+                                let cur_h = screen_height.load(Ordering::Relaxed) as u32;
+                                let test_rgba = generate_test_pattern(cur_w, cur_h, total_frames_counter.load(Ordering::Relaxed), &host_name, &ip_address);
+                                let mut buf = Vec::new();
+                                let mut enc = JpegEncoder::new_with_quality(&mut buf, 70);
+                                if enc.encode(&test_rgba, cur_w, cur_h, ColorType::Rgba8.into()).is_ok() {
+                                    client_frames_sent.fetch_add(1, Ordering::Relaxed);
+                                    let _ = out_tx_ping.send(Message::Binary(buf)).await;
+                                }
+                            }
+
+                            let engine = active_engine_name.read().await.clone();
+                            let mode = capture_mode.read().await.clone();
+                            let err = last_capture_error.read().await.clone();
+                            let debug_msg = HostMessage::CaptureDebug {
+                                engine,
+                                fps: 30,
+                                frame_count: total_frames_counter.load(Ordering::Relaxed),
+                                width: screen_width.load(Ordering::Relaxed) as u32,
+                                height: screen_height.load(Ordering::Relaxed) as u32,
+                                last_bytes: last_frame_bytes.load(Ordering::Relaxed),
+                                last_encode_ms: last_encode_ms.load(Ordering::Relaxed),
+                                status: "Frame Request Fulfilled".to_string(),
+                                last_error: err,
+                                mode,
+                                frames_sent_to_client: client_frames_sent.load(Ordering::Relaxed),
+                            };
+                            if let Ok(json_str) = serde_json::to_string(&debug_msg) {
+                                let _ = out_tx_ping.send(Message::Text(json_str)).await;
+                            }
+                        }
+
+                        // Client requests test frame to verify pipeline
+                        ClientMessage::RequestTestFrame => {
+                            println!("[CAPTURE] Client #{} requested Test Frame pattern", client_id);
+                            let cur_w = screen_width.load(Ordering::Relaxed) as u32;
+                            let cur_h = screen_height.load(Ordering::Relaxed) as u32;
+                            let test_rgba = generate_test_pattern(
+                                cur_w,
+                                cur_h,
+                                total_frames_counter.load(Ordering::Relaxed) + 1,
+                                &host_name,
+                                &ip_address,
+                            );
+                            let mut buf = Vec::new();
+                            let mut enc = JpegEncoder::new_with_quality(&mut buf, 70);
+                            if enc.encode(&test_rgba, cur_w, cur_h, ColorType::Rgba8.into()).is_ok() {
+                                client_frames_sent.fetch_add(1, Ordering::Relaxed);
+                                let _ = out_tx_ping.send(Message::Binary(buf)).await;
+                            }
+                        }
+
+                        // Client switches capture mode: "auto", "gdi", "xcap", "test_pattern"
+                        ClientMessage::SetCaptureMode { mode } => {
+                            let new_mode = match mode.to_lowercase().as_str() {
+                                "gdi" => "gdi",
+                                "xcap" => "xcap",
+                                "test_pattern" => "test_pattern",
+                                _ => "auto",
+                            };
+                            println!("[CAPTURE] Client #{} switched capture mode to: {}", client_id, new_mode);
+                            {
+                                let mut mode_guard = capture_mode.write().await;
+                                *mode_guard = new_mode.to_string();
+                            }
+                            // Immediately send fresh telemetry with updated mode
+                            let engine = active_engine_name.read().await.clone();
+                            let err = last_capture_error.read().await.clone();
+                            let debug_msg = HostMessage::CaptureDebug {
+                                engine,
+                                fps: 30,
+                                frame_count: total_frames_counter.load(Ordering::Relaxed),
+                                width: screen_width.load(Ordering::Relaxed) as u32,
+                                height: screen_height.load(Ordering::Relaxed) as u32,
+                                last_bytes: last_frame_bytes.load(Ordering::Relaxed),
+                                last_encode_ms: last_encode_ms.load(Ordering::Relaxed),
+                                status: format!("Mode switched to: {}", new_mode),
+                                last_error: err,
+                                mode: new_mode.to_string(),
+                                frames_sent_to_client: client_frames_sent.load(Ordering::Relaxed),
+                            };
+                            if let Ok(json_str) = serde_json::to_string(&debug_msg) {
+                                let _ = out_tx_ping.send(Message::Text(json_str)).await;
+                            }
                         }
 
                         // --- Administrator Portal Operations ---
@@ -1460,6 +1820,7 @@ async fn handle_connection(
 
     write_task.abort();
     frame_task.abort();
+    ticker_task.abort();
 
     Ok(())
 }

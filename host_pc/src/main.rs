@@ -13,7 +13,8 @@
 //! - Protected Administrator Portal (Password: Sagiv_2311)
 //!   - Real-time list of all connected mobile clients
 //!   - Remote Disconnect functionality
-//!   - Remote Lock functionality (indefinite or custom duration) & Remote Unlock
+//!   - Persistent Remote Lock (keys both device ID and IP so reopening app cannot bypass lock)
+//!   - Remote Unlock
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -41,6 +42,7 @@ pub struct ConnectedClientRecord {
     pub id: usize,
     pub ip: String,
     pub device_name: String,
+    pub device_id: String,
     pub connected_at: u64,
     pub is_locked: bool,
     pub locked_until: u64, // 0 = indefinite, >0 = epoch seconds
@@ -54,14 +56,17 @@ struct ClientRegistryEntry {
 }
 
 type ClientRegistry = Arc<Mutex<HashMap<usize, ClientRegistryEntry>>>;
-type LockedTable = Arc<Mutex<HashMap<String, u64>>>; // IP -> locked_until (0 = indefinite, >0 = epoch secs)
+type LockedTable = Arc<Mutex<HashMap<String, u64>>>; // Key (device_id or IP) -> locked_until (0 = indefinite, >0 = epoch secs)
 
 /// Inbound JSON messages sent by the mobile client.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "client_hello")]
-    ClientHello { device_name: Option<String> },
+    ClientHello {
+        device_name: Option<String>,
+        device_id: Option<String>,
+    },
     #[serde(rename = "move")]
     Move { x: f64, y: f64 },
     #[serde(rename = "move_relative")]
@@ -236,7 +241,10 @@ async fn broadcast_admin_clients(registry: &ClientRegistry) {
 /// Helper to verify if calling client is authenticated as admin
 async fn is_client_admin(registry: &ClientRegistry, client_id: usize) -> bool {
     let guard = registry.lock().await;
-    guard.get(&client_id).map(|e| e.record.is_admin).unwrap_or(false)
+    guard
+        .get(&client_id)
+        .map(|e| e.record.is_admin)
+        .unwrap_or(false)
 }
 
 /// Spawns a native Windows GUI window displaying the PC's IP and connection status
@@ -431,11 +439,11 @@ fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
     });
 }
 
-/// Universal fallback screen capture: uses native Windows GDI BitBlt
-/// Guaranteed to work on 100% of Windows machines (all GPUs, laptops, monitors)
+/// Universal, 100% reliable desktop capture via native Windows GDI BitBlt
 unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     let hdc_screen = GetDC(null_mut());
     if hdc_screen.is_null() {
@@ -456,11 +464,14 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
     let old_obj = SelectObject(hdc_mem, hbitmap);
     BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
 
+    // CRITICAL: Unselect hbitmap before GetDIBits to comply with Win32 GDI rules
+    SelectObject(hdc_mem, old_obj);
+
     let mut bi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width,
-            biHeight: -height, // negative for top-down bitmap
+            biHeight: height, // positive height for standard DIB
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -484,7 +495,6 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
         DIB_RGB_COLORS,
     );
 
-    SelectObject(hdc_mem, old_obj);
     DeleteObject(hbitmap);
     DeleteDC(hdc_mem);
     ReleaseDC(null_mut(), hdc_screen);
@@ -493,12 +503,23 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Convert BGRA to RGBA in-place
-    for chunk in bgra_buf.chunks_exact_mut(4) {
-        chunk.swap(0, 2);
+    // Convert bottom-to-top BGRA to top-to-bottom RGBA
+    let stride = (width * 4) as usize;
+    let mut rgba_buf = vec![0u8; (width * height * 4) as usize];
+    for y in 0..(height as usize) {
+        let src_row = (height as usize - 1 - y) * stride;
+        let dst_row = y * stride;
+        for x in 0..(width as usize) {
+            let src_idx = src_row + x * 4;
+            let dst_idx = dst_row + x * 4;
+            rgba_buf[dst_idx] = bgra_buf[src_idx + 2];     // Red
+            rgba_buf[dst_idx + 1] = bgra_buf[src_idx + 1]; // Green
+            rgba_buf[dst_idx + 2] = bgra_buf[src_idx];     // Blue
+            rgba_buf[dst_idx + 3] = 255;                  // Alpha
+        }
     }
 
-    Some(bgra_buf)
+    Some(rgba_buf)
 }
 
 #[tokio::main]
@@ -564,7 +585,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Enigo::new(&Settings::default()).expect("Failed to initialize Enigo input injector"),
     ));
 
-    // Client connection registry & lock table
+    // Client connection registry & persistent lock table
     let client_registry: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
     let locked_table: LockedTable = Arc::new(Mutex::new(HashMap::new()));
 
@@ -578,6 +599,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let capture_latest = latest_jpeg.clone();
 
     std::thread::spawn(move || {
+        // Initialize COM on this thread so DirectX and Windows Graphics Capture work without CO_E_NOTINITIALIZED
+        unsafe {
+            windows_sys::Win32::System::Com::CoInitializeEx(
+                std::ptr::null_mut(),
+                windows_sys::Win32::System::Com::COINIT_MULTITHREADED,
+            );
+        }
+
         println!("[CAPTURE] Initializing Screen Capture Engine (XCap + GDI Fallback)...");
         let target_frame_duration = Duration::from_millis(16);
         let mut last_valid_jpeg = Arc::new(Vec::new());
@@ -588,7 +617,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while capture_running.load(Ordering::Relaxed) {
             let start_time = Instant::now();
 
-            // Refresh monitor list every 5 seconds (not 60 times a second to prevent DirectX device churn)
+            // Refresh monitor list every 5 seconds (not on every frame)
             if last_monitor_check.elapsed() > Duration::from_secs(5) {
                 last_monitor_check = Instant::now();
                 if let Ok(m) = xcap::Monitor::all() {
@@ -660,7 +689,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let _ = capture_tx.send(frame);
                 }
             } else if !last_valid_jpeg.is_empty() {
-                // If momentary lock, resend last valid frame
                 let frame = FrameData {
                     jpeg_bytes: last_valid_jpeg.clone(),
                     width: width_ref.load(Ordering::Relaxed) as u32,
@@ -751,7 +779,7 @@ async fn handle_connection(
         .unwrap_or_default()
         .as_secs();
 
-    // Check if this client IP is currently locked in the persistent locked_table
+    // Check if this client IP is currently locked in persistent locked_table
     let mut is_initially_locked = false;
     let mut initial_locked_until = 0u64;
     {
@@ -761,7 +789,6 @@ async fn handle_connection(
                 is_initially_locked = true;
                 initial_locked_until = expiry;
             } else {
-                // Lock expired
                 lock_guard.remove(&client_ip);
             }
         }
@@ -772,6 +799,7 @@ async fn handle_connection(
         id: client_id,
         ip: client_ip.clone(),
         device_name: format!("Phone #{} ({})", client_id, client_ip),
+        device_id: client_ip.clone(),
         connected_at: now_sec,
         is_locked: is_initially_locked,
         locked_until: initial_locked_until,
@@ -789,8 +817,16 @@ async fn handle_connection(
         );
     }
 
-    // Broadcast updated client list to all connected admins
-    broadcast_admin_clients(&registry).await;
+    // Task A: Outbound frame writer
+    let out_tx_ping = out_tx.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if let Err(e) = ws_sink.send(msg).await {
+                eprintln!("[WS Sink #{}] Send error: {:?}", client_id, e);
+                break;
+            }
+        }
+    });
 
     // Send screen resolution and host info payload
     let initial_width = screen_width.load(Ordering::Relaxed) as u32;
@@ -832,18 +868,10 @@ async fn handle_connection(
         }
     }
 
-    // Task A: Write outbound frames and responses to client socket
-    let out_tx_ping = out_tx.clone();
-    let write_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Err(e) = ws_sink.send(msg).await {
-                eprintln!("[WS Sink #{}] Send error: {:?}", client_id, e);
-                break;
-            }
-        }
-    });
+    // Broadcast updated client list to all connected admins
+    broadcast_admin_clients(&registry).await;
 
-    // Task B: Forward video frames; gracefully skip lagged frames without terminating loop!
+    // Task B: Forward video frames
     let out_tx_frames = out_tx.clone();
     let frame_task = tokio::spawn(async move {
         loop {
@@ -853,7 +881,6 @@ async fn handle_connection(
                     let _ = out_tx_frames.try_send(msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Receiver fell behind: simply continue to receive the newest frame!
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -881,7 +908,7 @@ async fn handle_connection(
                         if let Some(entry) = reg.get_mut(&client_id) {
                             if entry.record.is_locked {
                                 if entry.record.locked_until > 0 && now >= entry.record.locked_until {
-                                    // Lock expired!
+                                    // Lock expired
                                     entry.record.is_locked = false;
                                     entry.record.locked_until = 0;
                                     let _ = entry.out_tx.try_send(Message::Text(
@@ -905,14 +932,64 @@ async fn handle_connection(
                     };
 
                     match cmd {
-                        // Client handshake with friendly name
-                        ClientMessage::ClientHello { device_name } => {
-                            if let Some(name) = device_name {
-                                let mut reg = registry.lock().await;
-                                if let Some(entry) = reg.get_mut(&client_id) {
-                                    entry.record.device_name = name;
+                        // Client handshake with friendly name & persistent device ID
+                        ClientMessage::ClientHello {
+                            device_name,
+                            device_id,
+                        } => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            let dev_id = device_id.unwrap_or_else(|| client_ip.clone());
+
+                            // Check persistent lock for this device ID
+                            let mut locked_by_id = false;
+                            let mut locked_until_by_id = 0u64;
+                            {
+                                let mut lock_guard = locked_table.lock().await;
+                                if let Some(&expiry) = lock_guard.get(&dev_id).or_else(|| lock_guard.get(&client_ip)) {
+                                    if expiry == 0 || expiry > now {
+                                        locked_by_id = true;
+                                        locked_until_by_id = expiry;
+                                    } else {
+                                        lock_guard.remove(&dev_id);
+                                        lock_guard.remove(&client_ip);
+                                    }
                                 }
                             }
+
+                            {
+                                let mut reg = registry.lock().await;
+                                if let Some(entry) = reg.get_mut(&client_id) {
+                                    if let Some(name) = device_name {
+                                        entry.record.device_name = name;
+                                    }
+                                    entry.record.device_id = dev_id.clone();
+                                    if locked_by_id {
+                                        entry.record.is_locked = true;
+                                        entry.record.locked_until = locked_until_by_id;
+                                    }
+                                }
+                            }
+
+                            if locked_by_id {
+                                let rem = if locked_until_by_id > now {
+                                    Some(locked_until_by_id - now)
+                                } else {
+                                    None
+                                };
+                                let _ = out_tx_ping.send(Message::Text(
+                                    serde_json::to_string(&HostMessage::LockStatus {
+                                        is_locked: true,
+                                        locked_until: locked_until_by_id,
+                                        remaining_seconds: rem,
+                                    })
+                                    .unwrap(),
+                                )).await;
+                            }
+
                             broadcast_admin_clients(&registry).await;
                         }
 
@@ -1022,17 +1099,22 @@ async fn handle_connection(
                                     if let Some(entry) = reg.get_mut(&target_id) {
                                         entry.record.is_locked = true;
                                         entry.record.locked_until = target_lock_until;
-                                        Some((entry.record.ip.clone(), entry.out_tx.clone()))
+                                        Some((
+                                            entry.record.ip.clone(),
+                                            entry.record.device_id.clone(),
+                                            entry.out_tx.clone(),
+                                        ))
                                     } else {
                                         None
                                     }
                                 };
 
-                                if let Some((target_ip, target_out)) = target_info {
-                                    // Persist in lock table
+                                if let Some((target_ip, target_dev_id, target_out)) = target_info {
+                                    // Persist in lock table by both IP and Device ID!
                                     {
                                         let mut lock_guard = locked_table.lock().await;
                                         lock_guard.insert(target_ip.clone(), target_lock_until);
+                                        lock_guard.insert(target_dev_id.clone(), target_lock_until);
                                     }
 
                                     let rem = if target_lock_until > now {
@@ -1053,8 +1135,8 @@ async fn handle_connection(
                                         .await;
 
                                     println!(
-                                        "[ADMIN] Admin #{} locked client #{} ({}) until {}",
-                                        client_id, target_id, target_ip, target_lock_until
+                                        "[ADMIN] Admin #{} locked client #{} ({}/{}) until {}",
+                                        client_id, target_id, target_ip, target_dev_id, target_lock_until
                                     );
                                 }
 
@@ -1070,16 +1152,21 @@ async fn handle_connection(
                                     if let Some(entry) = reg.get_mut(&target_id) {
                                         entry.record.is_locked = false;
                                         entry.record.locked_until = 0;
-                                        Some((entry.record.ip.clone(), entry.out_tx.clone()))
+                                        Some((
+                                            entry.record.ip.clone(),
+                                            entry.record.device_id.clone(),
+                                            entry.out_tx.clone(),
+                                        ))
                                     } else {
                                         None
                                     }
                                 };
 
-                                if let Some((target_ip, target_out)) = target_info {
+                                if let Some((target_ip, target_dev_id, target_out)) = target_info {
                                     {
                                         let mut lock_guard = locked_table.lock().await;
                                         lock_guard.remove(&target_ip);
+                                        lock_guard.remove(&target_dev_id);
                                     }
 
                                     let _ = target_out
@@ -1129,7 +1216,6 @@ async fn handle_connection(
                         | ClientMessage::Key { .. }
                         | ClientMessage::OpenUrl { .. }
                         | ClientMessage::LaunchApp { .. } if is_locked => {
-                            // Discard all inputs while client is locked
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()

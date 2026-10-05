@@ -62,6 +62,7 @@ class ConnectedPhoneClient {
   final int id;
   final String ip;
   final String deviceName;
+  final String deviceId;
   final int connectedAt;
   final bool isLocked;
   final int lockedUntil;
@@ -71,6 +72,7 @@ class ConnectedPhoneClient {
     required this.id,
     required this.ip,
     required this.deviceName,
+    required this.deviceId,
     required this.connectedAt,
     required this.isLocked,
     required this.lockedUntil,
@@ -82,6 +84,7 @@ class ConnectedPhoneClient {
       id: (json['id'] as num?)?.toInt() ?? 0,
       ip: json['ip']?.toString() ?? '',
       deviceName: json['device_name']?.toString() ?? 'Phone',
+      deviceId: json['device_id']?.toString() ?? '',
       connectedAt: (json['connected_at'] as num?)?.toInt() ?? 0,
       isLocked: json['is_locked'] == true,
       lockedUntil: (json['locked_until'] as num?)?.toInt() ?? 0,
@@ -117,6 +120,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   Uint8List? _latestFrameBytes;
 
   int _myClientId = 0;
+  String _myPersistentDeviceId = '';
   int _latencyMs = 0;
   int _fpsCount = 0;
   int _renderedFps = 0;
@@ -142,11 +146,15 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   bool _obscureAdminPassword = true;
   List<ConnectedPhoneClient> _connectedPhones = [];
 
-  // --- Client Lock State (If this phone was locked by PC admin) ---
+  // --- Persistent Client Lock State ---
   bool _isThisPhoneLocked = false;
   int _thisPhoneLockedUntil = 0;
   int _remainingLockSeconds = 0;
   Timer? _lockCountdownTimer;
+
+  // Local storage files for persistence across app restarts
+  File get _localLockFile => File('${Directory.systemTemp.path}/remote_pc_persistent_lock.json');
+  File get _localDeviceIdFile => File('${Directory.systemTemp.path}/remote_pc_persistent_device_id.txt');
 
   // Custom Websites & Shortcuts
   final List<WebShortcutItem> _webShortcuts = [
@@ -158,6 +166,83 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     const WebShortcutItem(name: 'Reddit', url: 'https://reddit.com', icon: Icons.forum),
     const WebShortcutItem(name: 'GitHub', url: 'https://github.com', icon: Icons.code),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _initPersistentState();
+  }
+
+  /// Initialize persistent device ID and check if previously locked
+  void _initPersistentState() {
+    try {
+      // 1. Get or create persistent device ID
+      if (_localDeviceIdFile.existsSync()) {
+        _myPersistentDeviceId = _localDeviceIdFile.readAsStringSync().trim();
+      }
+      if (_myPersistentDeviceId.isEmpty) {
+        _myPersistentDeviceId = 'phone_${DateTime.now().millisecondsSinceEpoch}_${DateTime.now().microsecond % 10000}';
+        _localDeviceIdFile.writeAsStringSync(_myPersistentDeviceId);
+      }
+
+      // 2. Check persistent lock file
+      if (_localLockFile.existsSync()) {
+        final content = _localLockFile.readAsStringSync();
+        final dynamic data = jsonDecode(content);
+        if (data is Map<String, dynamic> && data['is_locked'] == true) {
+          final int lockedUntil = (data['locked_until'] as num?)?.toInt() ?? 0;
+          final int nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+          if (lockedUntil == 0 || lockedUntil > nowSec) {
+            _isThisPhoneLocked = true;
+            _thisPhoneLockedUntil = lockedUntil;
+            _remainingLockSeconds = lockedUntil > 0 ? (lockedUntil - nowSec) : 0;
+            _startLockCountdown();
+          } else {
+            // Lock expired
+            _localLockFile.deleteSync();
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _persistLockState(bool locked, int lockedUntil) {
+    try {
+      if (locked) {
+        _localLockFile.writeAsStringSync(jsonEncode({
+          'is_locked': true,
+          'locked_until': lockedUntil,
+        }));
+      } else {
+        if (_localLockFile.existsSync()) {
+          _localLockFile.deleteSync();
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _startLockCountdown() {
+    _lockCountdownTimer?.cancel();
+    if (_thisPhoneLockedUntil > 0) {
+      _lockCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        if (!mounted || !_isThisPhoneLocked) {
+          timer.cancel();
+          return;
+        }
+        setState(() {
+          final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+          if (_thisPhoneLockedUntil > nowSec) {
+            _remainingLockSeconds = _thisPhoneLockedUntil - nowSec;
+          } else {
+            _isThisPhoneLocked = false;
+            _persistLockState(false, 0);
+            timer.cancel();
+          }
+        });
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -275,10 +360,11 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             });
             _startPingLoop();
 
-            // Send friendly handshake
+            // Send handshake with persistent device ID
             _sendJson({
               'type': 'client_hello',
               'device_name': 'Android Phone',
+              'device_id': _myPersistentDeviceId,
             });
           }
 
@@ -314,7 +400,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   void _disconnect() {
     _pingTimer?.cancel();
     _pingTimer = null;
-    _lockCountdownTimer?.cancel();
     _subscription?.cancel();
     _subscription = null;
     _channel?.sink.close();
@@ -417,22 +502,13 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             _remainingLockSeconds = remSec;
           });
 
-          _lockCountdownTimer?.cancel();
-          if (locked && remSec > 0) {
-            _lockCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-              if (!mounted || !_isThisPhoneLocked) {
-                timer.cancel();
-                return;
-              }
-              setState(() {
-                if (_remainingLockSeconds > 0) {
-                  _remainingLockSeconds--;
-                } else {
-                  _isThisPhoneLocked = false;
-                  timer.cancel();
-                }
-              });
-            });
+          // Save to local file so reopening app keeps the lock
+          _persistLockState(locked, lockedUntil);
+
+          if (locked) {
+            _startLockCountdown();
+          } else {
+            _lockCountdownTimer?.cancel();
           }
         }
       }
@@ -583,7 +659,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               ),
               const SizedBox(height: 6),
               const Text(
-                'Choose lock duration. The phone cannot control the PC until unlocked.',
+                'Choose lock duration. Even if the app is restarted, it stays locked until expired or unlocked.',
                 style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
               ),
               const SizedBox(height: 14),
@@ -788,7 +864,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               ],
             ),
 
-            // Persistent Full-Screen Lock Overlay if this phone is locked by Admin
+            // Persistent Full-Screen Lock Overlay if this phone is locked
             if (_isThisPhoneLocked) _buildPhoneLockedOverlay(),
           ],
         ),
@@ -803,7 +879,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     final timeStr = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
 
     return Container(
-      color: Colors.black.withOpacity(0.92),
+      color: Colors.black.withOpacity(0.95),
       width: double.infinity,
       height: double.infinity,
       padding: const EdgeInsets.all(24),
@@ -832,7 +908,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             ),
             const SizedBox(height: 10),
             const Text(
-              'Your access to the PC has been locked by the Administrator.\nAll remote mouse, keyboard, and screen inputs are disabled.',
+              'Your access to the PC has been locked by the Administrator.\nClosing or restarting this app will not bypass this lock.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 13),
             ),
@@ -1006,7 +1082,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       padding: const EdgeInsets.all(12.0),
       child: Column(
         children: [
-          // Top sensitivity bar
           Row(
             children: [
               const Icon(Icons.speed, size: 16, color: Color(0xFF94A3B8)),
@@ -1037,11 +1112,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           ),
           const SizedBox(height: 8),
 
-          // Main Visual Touchpad Card
           Expanded(
             child: Row(
               children: [
-                // Trackpad Glide Area
                 Expanded(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
@@ -1104,7 +1177,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
                 const SizedBox(width: 10),
 
-                // Dedicated Scroll Strip on the right
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onVerticalDragUpdate: (details) {
@@ -1145,7 +1217,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
           const SizedBox(height: 12),
 
-          // Big Physical Mouse Buttons
           SizedBox(
             height: 62,
             child: Row(
@@ -1207,7 +1278,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
           const SizedBox(height: 8),
 
-          // Quick System Action Row
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
@@ -1253,7 +1323,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  /// TAB 1: Live Screen Mirroring View
+  /// TAB 1: Live Screen Mirroring View (NEVER jumps back to touchpad!)
   Widget _buildScreenMirrorTab() {
     return Container(
       key: _viewportKey,
@@ -1291,36 +1361,28 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                 )
               : Center(
                   child: Padding(
-                    padding: const EdgeInsets.all(20.0),
+                    padding: const EdgeInsets.all(24.0),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Icon(Icons.videocam, size: 54, color: Color(0xFF38BDF8)),
-                        const SizedBox(height: 14),
-                        Text(
-                          _isConnected
-                              ? 'Connecting to PC display stream...'
-                              : _statusMessage,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 15, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'You can use the Touchpad tab to control your PC mouse right away!',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                        const SizedBox(
+                          width: 48,
+                          height: 48,
+                          child: CircularProgressIndicator(strokeWidth: 3, color: Color(0xFF38BDF8)),
                         ),
                         const SizedBox(height: 18),
-                        ElevatedButton.icon(
-                          onPressed: () => setState(() => _currentTabIndex = 0),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF0284C7),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                          ),
-                          icon: const Icon(Icons.mouse, size: 18),
-                          label: const Text('Open Laptop Touchpad', style: TextStyle(fontWeight: FontWeight.bold)),
+                        Text(
+                          _isConnected
+                              ? 'Streaming PC Desktop Screen...'
+                              : _statusMessage,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Receiving video frames at 60 FPS from host server.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                         ),
                       ],
                     ),
@@ -1529,7 +1591,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Container(
-            constraints: const Box64(maxWidth: 420),
+            constraints: const BoxConstraints(maxWidth: 420),
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
               color: const Color(0xFF1E293B),
@@ -1562,7 +1624,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  'Enter password to manage connected phones, disconnect devices, and apply remote locks.',
+                  'Enter password to manage connected phones, disconnect devices, and apply persistent remote locks.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                 ),
@@ -1622,7 +1684,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Admin Header Bar
           Row(
             children: [
               Container(
@@ -1669,7 +1730,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           const Divider(color: Color(0xFF334155), height: 1),
           const SizedBox(height: 12),
 
-          // Connected Devices List
           Expanded(
             child: _connectedPhones.isEmpty
                 ? const Center(
@@ -1748,7 +1808,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                                   ),
                                 ),
 
-                                // Status Badge
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                   decoration: BoxDecoration(
@@ -1773,11 +1832,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
                             const SizedBox(height: 10),
 
-                            // Action Buttons Row: Disconnect, Lock, Unlock
                             Row(
                               mainAxisAlignment: MainAxisAlignment.end,
                               children: [
-                                // Disconnect Button
                                 OutlinedButton.icon(
                                   onPressed: () => _adminDisconnectPhone(phone.id, phone.deviceName),
                                   style: OutlinedButton.styleFrom(
@@ -1794,7 +1851,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
                                 const SizedBox(width: 8),
 
-                                // Lock or Unlock Toggle Button
                                 if (phone.isLocked)
                                   ElevatedButton.icon(
                                     onPressed: () => _adminUnlockPhone(phone.id, phone.deviceName),
@@ -1871,8 +1927,4 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       ),
     );
   }
-}
-
-class Box64 extends BoxConstraints {
-  const Box64({super.maxWidth});
 }

@@ -348,22 +348,22 @@ fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
 /// Universal fallback screen capture: uses native Windows GDI BitBlt
 /// Guaranteed to work on 100% of Windows machines (all GPUs, laptops, monitors)
 unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
+    use std::ptr::null_mut;
     use windows_sys::Win32::Graphics::Gdi::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-    let hdc_screen = GetDC(0);
-    if hdc_screen == 0 {
+    let hdc_screen = GetDC(null_mut());
+    if hdc_screen.is_null() {
         return None;
     }
     let hdc_mem = CreateCompatibleDC(hdc_screen);
-    if hdc_mem == 0 {
-        ReleaseDC(0, hdc_screen);
+    if hdc_mem.is_null() {
+        ReleaseDC(null_mut(), hdc_screen);
         return None;
     }
     let hbitmap = CreateCompatibleBitmap(hdc_screen, width, height);
-    if hbitmap == 0 {
+    if hbitmap.is_null() {
         DeleteDC(hdc_mem);
-        ReleaseDC(0, hdc_screen);
+        ReleaseDC(null_mut(), hdc_screen);
         return None;
     }
 
@@ -401,7 +401,7 @@ unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
     SelectObject(hdc_mem, old_obj);
     DeleteObject(hbitmap);
     DeleteDC(hdc_mem);
-    ReleaseDC(0, hdc_screen);
+    ReleaseDC(null_mut(), hdc_screen);
 
     if lines == 0 {
         return None;

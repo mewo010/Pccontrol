@@ -9,15 +9,19 @@
 //! - Direct Win32 OS Cursor Control (SetCursorPos & GetCursorPos for 100% reliable mouse movement)
 //! - Enigo mouse button, scroll, keyboard text & key injection
 //! - Windows Key & Keyboard shortcuts (Win / Meta Start Menu, Alt+Tab, Win+D, TaskMgr)
-//! - Web Shortcut Launcher (opens sites on PC default browser)
-//! - Desktop App Launcher (opens apps & shortcuts on PC)
+//! - Web Shortcut Launcher & Desktop App Launcher
+//! - Protected Administrator Portal (Password: Sagiv_2311)
+//!   - Real-time list of all connected mobile clients
+//!   - Remote Disconnect functionality
+//!   - Remote Lock functionality (indefinite or custom duration) & Remote Unlock
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use futures_util::{SinkExt, StreamExt};
@@ -28,10 +32,36 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+/// Administrator password as requested by the user
+pub const ADMIN_PASSWORD: &str = "Sagiv_2311";
+
+/// Connected client profile tracked in memory
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectedClientRecord {
+    pub id: usize,
+    pub ip: String,
+    pub device_name: String,
+    pub connected_at: u64,
+    pub is_locked: bool,
+    pub locked_until: u64, // 0 = indefinite, >0 = epoch seconds
+    pub is_admin: bool,
+}
+
+/// Registry entry holding client metadata and its outbound message sender
+struct ClientRegistryEntry {
+    pub record: ConnectedClientRecord,
+    pub out_tx: mpsc::Sender<Message>,
+}
+
+type ClientRegistry = Arc<Mutex<HashMap<usize, ClientRegistryEntry>>>;
+type LockedTable = Arc<Mutex<HashMap<String, u64>>>; // IP -> locked_until (0 = indefinite, >0 = epoch secs)
+
 /// Inbound JSON messages sent by the mobile client.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    #[serde(rename = "client_hello")]
+    ClientHello { device_name: Option<String> },
     #[serde(rename = "move")]
     Move { x: f64, y: f64 },
     #[serde(rename = "move_relative")]
@@ -56,6 +86,21 @@ pub enum ClientMessage {
     LaunchApp { app: String },
     #[serde(rename = "ping")]
     Ping { timestamp: Option<u64> },
+
+    // Administrator Portal Messages
+    #[serde(rename = "admin_auth")]
+    AdminAuth { password: String },
+    #[serde(rename = "admin_get_clients")]
+    AdminGetClients,
+    #[serde(rename = "admin_disconnect_client")]
+    AdminDisconnectClient { target_id: usize },
+    #[serde(rename = "admin_lock_client")]
+    AdminLockClient {
+        target_id: usize,
+        duration_seconds: Option<u64>,
+    },
+    #[serde(rename = "admin_unlock_client")]
+    AdminUnlockClient { target_id: usize },
 }
 
 /// Outbound JSON messages sent back to the mobile client.
@@ -71,6 +116,23 @@ pub enum HostMessage {
         fps_target: u32,
         host_name: String,
         ip_address: String,
+        client_id: usize,
+    },
+    #[serde(rename = "admin_auth_result")]
+    AdminAuthResult {
+        success: bool,
+        message: String,
+        is_admin: bool,
+    },
+    #[serde(rename = "admin_clients_list")]
+    AdminClientsList {
+        clients: Vec<ConnectedClientRecord>,
+    },
+    #[serde(rename = "lock_status")]
+    LockStatus {
+        is_locked: bool,
+        locked_until: u64,
+        remaining_seconds: Option<u64>,
     },
 }
 
@@ -151,6 +213,30 @@ fn get_local_lan_ip() -> String {
         })
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// Broadcast updated connected client list to all authenticated admins
+async fn broadcast_admin_clients(registry: &ClientRegistry) {
+    let clients: Vec<ConnectedClientRecord> = {
+        let guard = registry.lock().await;
+        guard.values().map(|e| e.record.clone()).collect()
+    };
+
+    let msg = HostMessage::AdminClientsList { clients };
+    if let Ok(json_str) = serde_json::to_string(&msg) {
+        let guard = registry.lock().await;
+        for entry in guard.values() {
+            if entry.record.is_admin {
+                let _ = entry.out_tx.try_send(Message::Text(json_str.clone()));
+            }
+        }
+    }
+}
+
+/// Helper to verify if calling client is authenticated as admin
+async fn is_client_admin(registry: &ClientRegistry, client_id: usize) -> bool {
+    let guard = registry.lock().await;
+    guard.get(&client_id).map(|e| e.record.is_admin).unwrap_or(false)
 }
 
 /// Spawns a native Windows GUI window displaying the PC's IP and connection status
@@ -276,8 +362,8 @@ $t2.FontSize = 12; $t2.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
 $sp2.Children.Add($t2) | Out-Null
 
 $t3 = New-Object System.Windows.Controls.TextBlock
-$t3.Text = ". Windows Firewall: Configured & Active"
-$t3.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4ADE80")
+$t3.Text = ". Admin Pass: " + "Sagiv_2311"
+$t3.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#38BDF8")
 $t3.FontSize = 12
 $sp2.Children.Add($t3) | Out-Null
 $grid.Children.Add($sp2) | Out-Null
@@ -444,6 +530,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("  [+] PC NAME:              {}", host_name);
     println!("  [+] YOUR PC'S LOCAL IP:   {}", local_lan_ip);
     println!("  [+] PORT:                 8765");
+    println!("  [+] ADMIN PASSWORD:       {}", ADMIN_PASSWORD);
     println!();
     println!("  >>> ON YOUR MOBILE APP:");
     println!("      Either tap 'Auto-Detect PC' to connect instantly,");
@@ -476,6 +563,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let enigo = Arc::new(Mutex::new(
         Enigo::new(&Settings::default()).expect("Failed to initialize Enigo input injector"),
     ));
+
+    // Client connection registry & lock table
+    let client_registry: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let locked_table: LockedTable = Arc::new(Mutex::new(HashMap::new()));
 
     let is_running = Arc::new(AtomicBool::new(true));
 
@@ -605,6 +696,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let host_name_clone = host_name.clone();
         let ip_clone = local_lan_ip.clone();
         let latest_jpeg_clone = latest_jpeg.clone();
+        let registry_clone = client_registry.clone();
+        let locked_clone = locked_table.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -618,6 +711,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 host_name_clone,
                 ip_clone,
                 latest_jpeg_clone,
+                registry_clone,
+                locked_clone,
             )
             .await
             {
@@ -633,7 +728,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Handles a single connected WebSocket client.
 async fn handle_connection(
     stream: TcpStream,
-    _addr: SocketAddr,
+    addr: SocketAddr,
     client_id: usize,
     mut frame_rx: broadcast::Receiver<FrameData>,
     enigo: Arc<Mutex<Enigo>>,
@@ -642,11 +737,60 @@ async fn handle_connection(
     host_name: String,
     ip_address: String,
     latest_jpeg: Arc<RwLock<Vec<u8>>>,
+    registry: ClientRegistry,
+    locked_table: LockedTable,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_sink, mut ws_stream_reader) = ws_stream.split();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+
+    let client_ip = addr.ip().to_string();
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Check if this client IP is currently locked in the persistent locked_table
+    let mut is_initially_locked = false;
+    let mut initial_locked_until = 0u64;
+    {
+        let mut lock_guard = locked_table.lock().await;
+        if let Some(&expiry) = lock_guard.get(&client_ip) {
+            if expiry == 0 || expiry > now_sec {
+                is_initially_locked = true;
+                initial_locked_until = expiry;
+            } else {
+                // Lock expired
+                lock_guard.remove(&client_ip);
+            }
+        }
+    }
+
+    // Register this client in the central registry
+    let initial_record = ConnectedClientRecord {
+        id: client_id,
+        ip: client_ip.clone(),
+        device_name: format!("Phone #{} ({})", client_id, client_ip),
+        connected_at: now_sec,
+        is_locked: is_initially_locked,
+        locked_until: initial_locked_until,
+        is_admin: false,
+    };
+
+    {
+        let mut reg = registry.lock().await;
+        reg.insert(
+            client_id,
+            ClientRegistryEntry {
+                record: initial_record.clone(),
+                out_tx: out_tx.clone(),
+            },
+        );
+    }
+
+    // Broadcast updated client list to all connected admins
+    broadcast_admin_clients(&registry).await;
 
     // Send screen resolution and host info payload
     let initial_width = screen_width.load(Ordering::Relaxed) as u32;
@@ -657,9 +801,27 @@ async fn handle_connection(
         fps_target: 60,
         host_name,
         ip_address,
+        client_id,
     };
     if let Ok(info_json) = serde_json::to_string(&info_msg) {
         let _ = out_tx.send(Message::Text(info_json)).await;
+    }
+
+    // If client is locked upon joining, notify them immediately
+    if is_initially_locked {
+        let rem = if initial_locked_until > now_sec {
+            Some(initial_locked_until - now_sec)
+        } else {
+            None
+        };
+        let lock_msg = HostMessage::LockStatus {
+            is_locked: true,
+            locked_until: initial_locked_until,
+            remaining_seconds: rem,
+        };
+        if let Ok(lock_json) = serde_json::to_string(&lock_msg) {
+            let _ = out_tx.send(Message::Text(lock_json)).await;
+        }
     }
 
     // Immediately deliver the latest frame so client sees the screen without waiting!
@@ -709,7 +871,285 @@ async fn handle_connection(
                     let cur_w = screen_width.load(Ordering::Relaxed) as f64;
                     let cur_h = screen_height.load(Ordering::Relaxed) as f64;
 
+                    // Check if this client is currently locked
+                    let (is_locked, locked_until) = {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let mut reg = registry.lock().await;
+                        if let Some(entry) = reg.get_mut(&client_id) {
+                            if entry.record.is_locked {
+                                if entry.record.locked_until > 0 && now >= entry.record.locked_until {
+                                    // Lock expired!
+                                    entry.record.is_locked = false;
+                                    entry.record.locked_until = 0;
+                                    let _ = entry.out_tx.try_send(Message::Text(
+                                        serde_json::to_string(&HostMessage::LockStatus {
+                                            is_locked: false,
+                                            locked_until: 0,
+                                            remaining_seconds: None,
+                                        })
+                                        .unwrap(),
+                                    ));
+                                    (false, 0)
+                                } else {
+                                    (true, entry.record.locked_until)
+                                }
+                            } else {
+                                (false, 0)
+                            }
+                        } else {
+                            (false, 0)
+                        }
+                    };
+
                     match cmd {
+                        // Client handshake with friendly name
+                        ClientMessage::ClientHello { device_name } => {
+                            if let Some(name) = device_name {
+                                let mut reg = registry.lock().await;
+                                if let Some(entry) = reg.get_mut(&client_id) {
+                                    entry.record.device_name = name;
+                                }
+                            }
+                            broadcast_admin_clients(&registry).await;
+                        }
+
+                        // --- Administrator Portal Operations ---
+
+                        // Admin authentication with password Sagiv_2311
+                        ClientMessage::AdminAuth { password } => {
+                            if password.trim() == ADMIN_PASSWORD {
+                                {
+                                    let mut reg = registry.lock().await;
+                                    if let Some(entry) = reg.get_mut(&client_id) {
+                                        entry.record.is_admin = true;
+                                    }
+                                }
+                                let _ = out_tx
+                                    .send(Message::Text(
+                                        serde_json::to_string(&HostMessage::AdminAuthResult {
+                                            success: true,
+                                            message: "Administrator access granted.".to_string(),
+                                            is_admin: true,
+                                        })
+                                        .unwrap(),
+                                    ))
+                                    .await;
+
+                                // Send current connected client list
+                                let clients: Vec<ConnectedClientRecord> = {
+                                    let reg = registry.lock().await;
+                                    reg.values().map(|e| e.record.clone()).collect()
+                                };
+                                let _ = out_tx
+                                    .send(Message::Text(
+                                        serde_json::to_string(&HostMessage::AdminClientsList {
+                                            clients,
+                                        })
+                                        .unwrap(),
+                                    ))
+                                    .await;
+                            } else {
+                                let _ = out_tx
+                                    .send(Message::Text(
+                                        serde_json::to_string(&HostMessage::AdminAuthResult {
+                                            success: false,
+                                            message: "Incorrect administrator password.".to_string(),
+                                            is_admin: false,
+                                        })
+                                        .unwrap(),
+                                    ))
+                                    .await;
+                            }
+                        }
+
+                        // Admin request to get clients list
+                        ClientMessage::AdminGetClients => {
+                            if is_client_admin(&registry, client_id).await {
+                                let clients: Vec<ConnectedClientRecord> = {
+                                    let reg = registry.lock().await;
+                                    reg.values().map(|e| e.record.clone()).collect()
+                                };
+                                let _ = out_tx
+                                    .send(Message::Text(
+                                        serde_json::to_string(&HostMessage::AdminClientsList {
+                                            clients,
+                                        })
+                                        .unwrap(),
+                                    ))
+                                    .await;
+                            }
+                        }
+
+                        // Admin request to disconnect a connected phone
+                        ClientMessage::AdminDisconnectClient { target_id } => {
+                            if is_client_admin(&registry, client_id).await {
+                                let target_sender = {
+                                    let mut reg = registry.lock().await;
+                                    reg.remove(&target_id)
+                                };
+                                if let Some(target) = target_sender {
+                                    let _ = target.out_tx.send(Message::Close(None)).await;
+                                    println!(
+                                        "[ADMIN] Admin #{} disconnected client #{} ({})",
+                                        client_id, target_id, target.record.ip
+                                    );
+                                }
+                                broadcast_admin_clients(&registry).await;
+                            }
+                        }
+
+                        // Admin request to lock a connected phone (indefinite or timed)
+                        ClientMessage::AdminLockClient {
+                            target_id,
+                            duration_seconds,
+                        } => {
+                            if is_client_admin(&registry, client_id).await {
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+
+                                let target_lock_until = match duration_seconds {
+                                    Some(sec) if sec > 0 => now + sec,
+                                    _ => 0, // Indefinite lock
+                                };
+
+                                let target_info = {
+                                    let mut reg = registry.lock().await;
+                                    if let Some(entry) = reg.get_mut(&target_id) {
+                                        entry.record.is_locked = true;
+                                        entry.record.locked_until = target_lock_until;
+                                        Some((entry.record.ip.clone(), entry.out_tx.clone()))
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some((target_ip, target_out)) = target_info {
+                                    // Persist in lock table
+                                    {
+                                        let mut lock_guard = locked_table.lock().await;
+                                        lock_guard.insert(target_ip.clone(), target_lock_until);
+                                    }
+
+                                    let rem = if target_lock_until > now {
+                                        Some(target_lock_until - now)
+                                    } else {
+                                        None
+                                    };
+
+                                    let _ = target_out
+                                        .send(Message::Text(
+                                            serde_json::to_string(&HostMessage::LockStatus {
+                                                is_locked: true,
+                                                locked_until: target_lock_until,
+                                                remaining_seconds: rem,
+                                            })
+                                            .unwrap(),
+                                        ))
+                                        .await;
+
+                                    println!(
+                                        "[ADMIN] Admin #{} locked client #{} ({}) until {}",
+                                        client_id, target_id, target_ip, target_lock_until
+                                    );
+                                }
+
+                                broadcast_admin_clients(&registry).await;
+                            }
+                        }
+
+                        // Admin request to unlock a locked phone
+                        ClientMessage::AdminUnlockClient { target_id } => {
+                            if is_client_admin(&registry, client_id).await {
+                                let target_info = {
+                                    let mut reg = registry.lock().await;
+                                    if let Some(entry) = reg.get_mut(&target_id) {
+                                        entry.record.is_locked = false;
+                                        entry.record.locked_until = 0;
+                                        Some((entry.record.ip.clone(), entry.out_tx.clone()))
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some((target_ip, target_out)) = target_info {
+                                    {
+                                        let mut lock_guard = locked_table.lock().await;
+                                        lock_guard.remove(&target_ip);
+                                    }
+
+                                    let _ = target_out
+                                        .send(Message::Text(
+                                            serde_json::to_string(&HostMessage::LockStatus {
+                                                is_locked: false,
+                                                locked_until: 0,
+                                                remaining_seconds: None,
+                                            })
+                                            .unwrap(),
+                                        ))
+                                        .await;
+
+                                    println!(
+                                        "[ADMIN] Admin #{} unlocked client #{} ({})",
+                                        client_id, target_id, target_ip
+                                    );
+                                }
+
+                                broadcast_admin_clients(&registry).await;
+                            }
+                        }
+
+                        // Latency Ping (allowed even when locked)
+                        ClientMessage::Ping { timestamp } => {
+                            let ts = timestamp.unwrap_or_else(|| {
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64
+                            });
+                            let pong = HostMessage::Pong { timestamp: ts };
+                            if let Ok(pong_json) = serde_json::to_string(&pong) {
+                                let _ = out_tx_ping.send(Message::Text(pong_json)).await;
+                            }
+                        }
+
+                        // --- Device Control Operations (BLOCKED IF CLIENT IS LOCKED) ---
+                        ClientMessage::Move { .. }
+                        | ClientMessage::MoveRelative { .. }
+                        | ClientMessage::MouseDown { .. }
+                        | ClientMessage::MouseUp { .. }
+                        | ClientMessage::Click { .. }
+                        | ClientMessage::DoubleClick { .. }
+                        | ClientMessage::Scroll { .. }
+                        | ClientMessage::Type { .. }
+                        | ClientMessage::Key { .. }
+                        | ClientMessage::OpenUrl { .. }
+                        | ClientMessage::LaunchApp { .. } if is_locked => {
+                            // Discard all inputs while client is locked
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let rem = if locked_until > now {
+                                Some(locked_until - now)
+                            } else {
+                                None
+                            };
+                            let _ = out_tx_ping
+                                .try_send(Message::Text(
+                                    serde_json::to_string(&HostMessage::LockStatus {
+                                        is_locked: true,
+                                        locked_until,
+                                        remaining_seconds: rem,
+                                    })
+                                    .unwrap(),
+                                ));
+                        }
+
                         // Direct Touch Screen / Absolute Mouse Positioning via Windows user32 SetCursorPos
                         ClientMessage::Move { x, y } => {
                             let clamped_x = (x.clamp(0.0, 1.0) * cur_w) as i32;
@@ -720,6 +1160,7 @@ async fn handle_connection(
                                 );
                             }
                         }
+
                         // Laptop Trackpad / Relative Mouse Movement via Windows user32 GetCursorPos + SetCursorPos
                         ClientMessage::MoveRelative { dx, dy } => {
                             unsafe {
@@ -732,6 +1173,7 @@ async fn handle_connection(
                                 }
                             }
                         }
+
                         // Mouse Press / Dragging
                         ClientMessage::MouseDown { button } => {
                             let mut enigo_guard = enigo.lock().await;
@@ -742,6 +1184,7 @@ async fn handle_connection(
                             };
                             let _ = enigo_guard.button(btn, Direction::Press);
                         }
+
                         // Mouse Release
                         ClientMessage::MouseUp { button } => {
                             let mut enigo_guard = enigo.lock().await;
@@ -752,6 +1195,7 @@ async fn handle_connection(
                             };
                             let _ = enigo_guard.button(btn, Direction::Release);
                         }
+
                         // Mouse Click
                         ClientMessage::Click { button } => {
                             let mut enigo_guard = enigo.lock().await;
@@ -762,6 +1206,7 @@ async fn handle_connection(
                             };
                             let _ = enigo_guard.button(btn, Direction::Click);
                         }
+
                         // Double Click
                         ClientMessage::DoubleClick { button } => {
                             let mut enigo_guard = enigo.lock().await;
@@ -773,6 +1218,7 @@ async fn handle_connection(
                             let _ = enigo_guard.button(btn, Direction::Click);
                             let _ = enigo_guard.button(btn, Direction::Click);
                         }
+
                         // Mouse Scroll
                         ClientMessage::Scroll { dx: _, dy } => {
                             if let Some(y) = dy {
@@ -780,23 +1226,23 @@ async fn handle_connection(
                                 let _ = enigo_guard.scroll(y, Axis::Vertical);
                             }
                         }
+
                         // Keyboard Text Typing
                         ClientMessage::Type { text } => {
                             let mut enigo_guard = enigo.lock().await;
                             let _ = enigo_guard.text(&text);
                         }
+
                         // Keyboard Key and Windows Key Actions
                         ClientMessage::Key { key } => {
                             let mut enigo_guard = enigo.lock().await;
                             let lower = key.to_lowercase();
                             match lower.as_str() {
-                                // Windows Start Menu key (triggers VK_LWIN + Ctrl+Esc for 100% reliability)
                                 "win" | "meta" | "super" | "windows" => {
                                     let _ = enigo_guard.key(Key::Meta, Direction::Press);
                                     std::thread::sleep(Duration::from_millis(50));
                                     let _ = enigo_guard.key(Key::Meta, Direction::Release);
 
-                                    // Fallback Ctrl+Esc triggers Start Menu on all Windows configurations
                                     let _ = enigo_guard.key(Key::Control, Direction::Press);
                                     let _ = enigo_guard.key(Key::Escape, Direction::Click);
                                     let _ = enigo_guard.key(Key::Control, Direction::Release);
@@ -837,7 +1283,9 @@ async fn handle_connection(
                                     let _ = enigo_guard.key(Key::Control, Direction::Release);
                                 }
                                 "taskmgr" => {
-                                    let _ = Command::new("cmd").args(["/C", "start", "", "taskmgr"]).spawn();
+                                    let _ = Command::new("cmd")
+                                        .args(["/C", "start", "", "taskmgr"])
+                                        .spawn();
                                 }
                                 "enter" | "return" => {
                                     let _ = enigo_guard.key(Key::Return, Direction::Click);
@@ -884,37 +1332,27 @@ async fn handle_connection(
                                 _ => {}
                             }
                         }
-                        // Open Website Shortcut in PC's default browser
+
+                        // Open Website Shortcut in PC default browser
                         ClientMessage::OpenUrl { url } => {
                             println!("[SHORTCUT] Opening site on PC: {}", url);
-                            let target = if !url.starts_with("http://") && !url.starts_with("https://") {
-                                format!("https://{}", url)
-                            } else {
-                                url
-                            };
+                            let target =
+                                if !url.starts_with("http://") && !url.starts_with("https://") {
+                                    format!("https://{}", url)
+                                } else {
+                                    url
+                                };
                             let _ = Command::new("cmd")
                                 .args(["/C", "start", "", &target])
                                 .spawn();
                         }
+
                         // Launch Desktop Application or Shortcut
                         ClientMessage::LaunchApp { app } => {
                             println!("[APP LAUNCHER] Launching application or file: {}", app);
                             let _ = Command::new("cmd")
                                 .args(["/C", "start", "", &app])
                                 .spawn();
-                        }
-                        // Latency Ping
-                        ClientMessage::Ping { timestamp } => {
-                            let ts = timestamp.unwrap_or_else(|| {
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64
-                            });
-                            let pong = HostMessage::Pong { timestamp: ts };
-                            if let Ok(pong_json) = serde_json::to_string(&pong) {
-                                let _ = out_tx_ping.send(Message::Text(pong_json)).await;
-                            }
                         }
                     }
                 }
@@ -927,6 +1365,13 @@ async fn handle_connection(
             _ => {}
         }
     }
+
+    // Clean up disconnected client from registry
+    {
+        let mut reg = registry.lock().await;
+        reg.remove(&client_id);
+    }
+    broadcast_admin_clients(&registry).await;
 
     write_task.abort();
     frame_task.abort();

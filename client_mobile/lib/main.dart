@@ -58,6 +58,38 @@ class WebShortcutItem {
   const WebShortcutItem({required this.name, required this.url, required this.icon});
 }
 
+class ConnectedPhoneClient {
+  final int id;
+  final String ip;
+  final String deviceName;
+  final int connectedAt;
+  final bool isLocked;
+  final int lockedUntil;
+  final bool isAdmin;
+
+  ConnectedPhoneClient({
+    required this.id,
+    required this.ip,
+    required this.deviceName,
+    required this.connectedAt,
+    required this.isLocked,
+    required this.lockedUntil,
+    required this.isAdmin,
+  });
+
+  factory ConnectedPhoneClient.fromJson(Map<String, dynamic> json) {
+    return ConnectedPhoneClient(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      ip: json['ip']?.toString() ?? '',
+      deviceName: json['device_name']?.toString() ?? 'Phone',
+      connectedAt: (json['connected_at'] as num?)?.toInt() ?? 0,
+      isLocked: json['is_locked'] == true,
+      lockedUntil: (json['locked_until'] as num?)?.toInt() ?? 0,
+      isAdmin: json['is_admin'] == true,
+    );
+  }
+}
+
 class RemoteControllerScreen extends StatefulWidget {
   const RemoteControllerScreen({super.key});
 
@@ -70,6 +102,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       TextEditingController(text: '192.168.1.100:8765');
   final TextEditingController _textController = TextEditingController();
   final TextEditingController _customAppController = TextEditingController();
+  final TextEditingController _adminPasswordController = TextEditingController();
   final FocusNode _textFocusNode = FocusNode();
   final GlobalKey _viewportKey = GlobalKey();
 
@@ -83,6 +116,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   String _statusMessage = 'Tap "Auto-Detect PC" or enter IP';
   Uint8List? _latestFrameBytes;
 
+  int _myClientId = 0;
   int _latencyMs = 0;
   int _fpsCount = 0;
   int _renderedFps = 0;
@@ -92,7 +126,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   double _remoteHeight = 1080;
   String _hostPcName = '';
 
-  // Active Screen Tab: 0 = Touchpad, 1 = Screen Mirror, 2 = Apps & Shortcuts
+  // Active Navigation Tab: 0 = Touchpad, 1 = Screen Mirror, 2 = Apps & Web, 3 = Admin
   int _currentTabIndex = 0;
 
   // Trackpad Settings
@@ -101,6 +135,18 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
   // Screen View Fit/Stretch
   bool _isFitScreen = true;
+
+  // --- Admin Portal State ---
+  bool _isAdminAuthenticated = false;
+  bool _isAdminAuthenticating = false;
+  bool _obscureAdminPassword = true;
+  List<ConnectedPhoneClient> _connectedPhones = [];
+
+  // --- Client Lock State (If this phone was locked by PC admin) ---
+  bool _isThisPhoneLocked = false;
+  int _thisPhoneLockedUntil = 0;
+  int _remainingLockSeconds = 0;
+  Timer? _lockCountdownTimer;
 
   // Custom Websites & Shortcuts
   final List<WebShortcutItem> _webShortcuts = [
@@ -116,9 +162,11 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   @override
   void dispose() {
     _disconnect();
+    _lockCountdownTimer?.cancel();
     _ipController.dispose();
     _textController.dispose();
     _customAppController.dispose();
+    _adminPasswordController.dispose();
     _textFocusNode.dispose();
     super.dispose();
   }
@@ -226,6 +274,12 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               _statusMessage = 'Connected to ${_hostPcName.isNotEmpty ? _hostPcName : wsUrl}';
             });
             _startPingLoop();
+
+            // Send friendly handshake
+            _sendJson({
+              'type': 'client_hello',
+              'device_name': 'Android Phone',
+            });
           }
 
           if (data is Uint8List) {
@@ -260,6 +314,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   void _disconnect() {
     _pingTimer?.cancel();
     _pingTimer = null;
+    _lockCountdownTimer?.cancel();
     _subscription?.cancel();
     _subscription = null;
     _channel?.sink.close();
@@ -269,9 +324,11 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       setState(() {
         _isConnected = false;
         _isConnecting = false;
+        _isAdminAuthenticated = false;
         _latencyMs = 0;
         _renderedFps = 0;
         _latestFrameBytes = null;
+        _connectedPhones = [];
         _statusMessage = 'Disconnected';
       });
     }
@@ -293,6 +350,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _onFrameReceived(Uint8List frameBytes) {
+    if (_isThisPhoneLocked) return;
+
     _fpsCount++;
     final now = DateTime.now();
     if (now.difference(_lastFpsCheck).inMilliseconds >= 1000) {
@@ -328,7 +387,53 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             if (decoded['host_name'] != null) {
               _hostPcName = decoded['host_name'].toString();
             }
+            if (decoded['client_id'] != null) {
+              _myClientId = (decoded['client_id'] as num).toInt();
+            }
           });
+        } else if (type == 'admin_auth_result') {
+          final success = decoded['success'] == true;
+          final msg = decoded['message']?.toString() ?? '';
+          setState(() {
+            _isAdminAuthenticating = false;
+            _isAdminAuthenticated = success;
+          });
+          _showToast(msg);
+        } else if (type == 'admin_clients_list') {
+          final listRaw = decoded['clients'] as List<dynamic>? ?? [];
+          setState(() {
+            _connectedPhones = listRaw
+                .map((e) => ConnectedPhoneClient.fromJson(e as Map<String, dynamic>))
+                .toList();
+          });
+        } else if (type == 'lock_status') {
+          final locked = decoded['is_locked'] == true;
+          final lockedUntil = (decoded['locked_until'] as num?)?.toInt() ?? 0;
+          final remSec = (decoded['remaining_seconds'] as num?)?.toInt() ?? 0;
+
+          setState(() {
+            _isThisPhoneLocked = locked;
+            _thisPhoneLockedUntil = lockedUntil;
+            _remainingLockSeconds = remSec;
+          });
+
+          _lockCountdownTimer?.cancel();
+          if (locked && remSec > 0) {
+            _lockCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+              if (!mounted || !_isThisPhoneLocked) {
+                timer.cancel();
+                return;
+              }
+              setState(() {
+                if (_remainingLockSeconds > 0) {
+                  _remainingLockSeconds--;
+                } else {
+                  _isThisPhoneLocked = false;
+                  timer.cancel();
+                }
+              });
+            });
+          }
         }
       }
     } catch (_) {}
@@ -341,35 +446,41 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     } catch (_) {}
   }
 
-  // --- Mouse Actions ---
+  // --- Mouse & Keyboard Actions ---
 
   void _handleTrackpadMove(DragUpdateDetails details) {
+    if (_isThisPhoneLocked) return;
     final dx = details.delta.dx * _trackpadSensitivity;
     final dy = details.delta.dy * _trackpadSensitivity;
     _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
   }
 
   void _handleLeftClick() {
+    if (_isThisPhoneLocked) return;
     _sendJson({'type': 'click', 'button': 'left'});
     HapticFeedback.lightImpact();
   }
 
   void _handleRightClick() {
+    if (_isThisPhoneLocked) return;
     _sendJson({'type': 'click', 'button': 'right'});
     HapticFeedback.mediumImpact();
     _showToast('Right clicked');
   }
 
   void _handleDoubleClick() {
+    if (_isThisPhoneLocked) return;
     _sendJson({'type': 'double_click', 'button': 'left'});
     HapticFeedback.selectionClick();
   }
 
   void _handleScroll(int dy) {
+    if (_isThisPhoneLocked) return;
     _sendJson({'type': 'scroll', 'dy': dy});
   }
 
   void _toggleDragLock() {
+    if (_isThisPhoneLocked) return;
     setState(() {
       _isDragLocked = !_isDragLocked;
     });
@@ -383,7 +494,139 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     HapticFeedback.mediumImpact();
   }
 
-  // --- Direct Touch on Screen View ---
+  void _sendTypingText() {
+    if (_isThisPhoneLocked) return;
+    final text = _textController.text;
+    if (text.isEmpty) return;
+    _sendJson({'type': 'type', 'text': text});
+    _textController.clear();
+  }
+
+  void _sendKey(String key) {
+    if (_isThisPhoneLocked) return;
+    _sendJson({'type': 'key', 'key': key});
+    if (key == 'win') {
+      _showToast('Toggled Windows Start Menu');
+    }
+  }
+
+  void _openWebUrl(String url) {
+    if (_isThisPhoneLocked) return;
+    _sendJson({'type': 'open_url', 'url': url});
+    _showToast('Opening $url on PC');
+  }
+
+  void _launchApp(String app) {
+    if (_isThisPhoneLocked || app.trim().isEmpty) return;
+    _sendJson({'type': 'launch_app', 'app': app.trim()});
+    _showToast('Launching $app on PC');
+  }
+
+  // --- Administrator Operations ---
+
+  void _authenticateAdmin() {
+    final password = _adminPasswordController.text.trim();
+    if (password.isEmpty) {
+      _showToast('Please enter admin password');
+      return;
+    }
+    setState(() {
+      _isAdminAuthenticating = true;
+    });
+    _sendJson({
+      'type': 'admin_auth',
+      'password': password,
+    });
+  }
+
+  void _adminDisconnectPhone(int targetId, String name) {
+    _sendJson({
+      'type': 'admin_disconnect_client',
+      'target_id': targetId,
+    });
+    _showToast('Disconnected $name');
+  }
+
+  void _adminUnlockPhone(int targetId, String name) {
+    _sendJson({
+      'type': 'admin_unlock_client',
+      'target_id': targetId,
+    });
+    _showToast('Unlocked $name');
+  }
+
+  void _showLockDurationDialog(int targetId, String phoneName) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0F172A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.lock, color: Color(0xFFF59E0B), size: 22),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Lock Access: $phoneName',
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Choose lock duration. The phone cannot control the PC until unlocked.',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+              ),
+              const SizedBox(height: 14),
+
+              _buildLockOption(ctx, targetId, 'Until I Unlock It (Indefinite)', 0, Icons.lock_clock),
+              _buildLockOption(ctx, targetId, '1 Minute (Quick Test)', 60, Icons.timer_10),
+              _buildLockOption(ctx, targetId, '5 Minutes', 300, Icons.timer),
+              _buildLockOption(ctx, targetId, '15 Minutes', 900, Icons.timer),
+              _buildLockOption(ctx, targetId, '30 Minutes', 1800, Icons.hourglass_bottom),
+              _buildLockOption(ctx, targetId, '1 Hour', 3600, Icons.hourglass_full),
+
+              const SizedBox(height: 10),
+              Center(
+                child: TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Cancel', style: TextStyle(color: Color(0xFF94A3B8))),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildLockOption(BuildContext ctx, int targetId, String label, int seconds, IconData icon) {
+    return ListTile(
+      dense: true,
+      leading: Icon(icon, color: const Color(0xFF38BDF8), size: 20),
+      title: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+      onTap: () {
+        Navigator.pop(ctx);
+        _sendJson({
+          'type': 'admin_lock_client',
+          'target_id': targetId,
+          'duration_seconds': seconds,
+        });
+        _showToast('Lock applied: $label');
+      },
+    );
+  }
+
+  // --- Screen Tap Handlers ---
 
   Offset? _getNormalizedCoordinates(Offset localPosition) {
     final RenderBox? box =
@@ -435,6 +678,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleScreenTap(Offset localPosition) {
+    if (_isThisPhoneLocked) return;
     final coords = _getNormalizedCoordinates(localPosition);
     if (coords == null) return;
     _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
@@ -442,6 +686,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleScreenLongPress(Offset localPosition) {
+    if (_isThisPhoneLocked) return;
     final coords = _getNormalizedCoordinates(localPosition);
     if (coords == null) return;
     _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
@@ -451,6 +696,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleScreenPanStart(DragStartDetails details) {
+    if (_isThisPhoneLocked) return;
     final coords = _getNormalizedCoordinates(details.localPosition);
     if (coords != null) {
       _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
@@ -459,6 +705,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleScreenPanUpdate(DragUpdateDetails details) {
+    if (_isThisPhoneLocked) return;
     final coords = _getNormalizedCoordinates(details.localPosition);
     if (coords != null) {
       _sendJson({'type': 'move', 'x': coords.dx, 'y': coords.dy});
@@ -466,34 +713,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   }
 
   void _handleScreenPanEnd(DragEndDetails details) {
+    if (_isThisPhoneLocked) return;
     _sendJson({'type': 'mouse_up', 'button': 'left'});
-  }
-
-  // --- Keyboard & App Launchers ---
-
-  void _sendTypingText() {
-    final text = _textController.text;
-    if (text.isEmpty) return;
-    _sendJson({'type': 'type', 'text': text});
-    _textController.clear();
-  }
-
-  void _sendKey(String key) {
-    _sendJson({'type': 'key', 'key': key});
-    if (key == 'win') {
-      _showToast('Toggled Windows Start Menu');
-    }
-  }
-
-  void _openWebUrl(String url) {
-    _sendJson({'type': 'open_url', 'url': url});
-    _showToast('Opening $url on PC');
-  }
-
-  void _launchApp(String app) {
-    if (app.trim().isEmpty) return;
-    _sendJson({'type': 'launch_app', 'app': app.trim()});
-    _showToast('Launching $app on PC');
   }
 
   void _showAddShortcutDialog() {
@@ -557,11 +778,97 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            _buildHeader(),
-            Expanded(child: _buildCurrentTabBody()),
-            _buildBottomNavigationBar(),
+            Column(
+              children: [
+                _buildHeader(),
+                Expanded(child: _buildCurrentTabBody()),
+                _buildBottomNavigationBar(),
+              ],
+            ),
+
+            // Persistent Full-Screen Lock Overlay if this phone is locked by Admin
+            if (_isThisPhoneLocked) _buildPhoneLockedOverlay(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Lock screen overlay when this device is locked by PC Admin
+  Widget _buildPhoneLockedOverlay() {
+    final minutes = _remainingLockSeconds ~/ 60;
+    final seconds = _remainingLockSeconds % 60;
+    final timeStr = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+
+    return Container(
+      color: Colors.black.withOpacity(0.92),
+      width: double.infinity,
+      height: double.infinity,
+      padding: const EdgeInsets.all(24),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFFF59E0B).withOpacity(0.2),
+                border: Border.all(color: const Color(0xFFF59E0B), width: 3),
+              ),
+              child: const Icon(Icons.lock, size: 64, color: Color(0xFFF59E0B)),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              'DEVICE LOCKED BY ADMIN',
+              style: TextStyle(
+                color: Color(0xFFF59E0B),
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.5,
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Your access to the PC has been locked by the Administrator.\nAll remote mouse, keyboard, and screen inputs are disabled.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 13),
+            ),
+            const SizedBox(height: 20),
+
+            if (_thisPhoneLockedUntil > 0)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.5)),
+                ),
+                child: Column(
+                  children: [
+                    const Text('TIME REMAINING', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    Text(
+                      timeStr,
+                      style: const TextStyle(color: Color(0xFF38BDF8), fontSize: 26, fontWeight: FontWeight.bold, letterSpacing: 2),
+                    ),
+                  ],
+                ),
+              )
+            else
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text(
+                  'Locked until unlocked by PC Administrator',
+                  style: TextStyle(color: Color(0xFFF59E0B), fontSize: 12, fontWeight: FontWeight.w600),
+                ),
+              ),
           ],
         ),
       ),
@@ -685,12 +992,14 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         return _buildScreenMirrorTab();
       case 2:
         return _buildShortcutsAndAppsTab();
+      case 3:
+        return _buildAdminTab();
       default:
         return _buildDedicatedTouchpadTab();
     }
   }
 
-  /// TAB 0: Dedicated Laptop Touchpad UI with Visible Trackpad & Big Click Buttons
+  /// TAB 0: Dedicated Laptop Touchpad UI
   Widget _buildDedicatedTouchpadTab() {
     return Container(
       color: const Color(0xFF0B1120),
@@ -759,7 +1068,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
-                          // Center guidance text & icon
                           Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -837,12 +1145,11 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
           const SizedBox(height: 12),
 
-          // Big Physical Mouse Buttons: LEFT CLICK & RIGHT CLICK
+          // Big Physical Mouse Buttons
           SizedBox(
             height: 62,
             child: Row(
               children: [
-                // Big Left Click Button
                 Expanded(
                   flex: 5,
                   child: ElevatedButton.icon(
@@ -860,10 +1167,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     ),
                   ),
                 ),
-
                 const SizedBox(width: 8),
-
-                // Drag Lock Toggle Button
                 SizedBox(
                   width: 58,
                   height: double.infinity,
@@ -878,10 +1182,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     child: Icon(_isDragLocked ? Icons.lock : Icons.lock_open, size: 22),
                   ),
                 ),
-
                 const SizedBox(width: 8),
-
-                // Big Right Click Button
                 Expanded(
                   flex: 5,
                   child: ElevatedButton.icon(
@@ -952,7 +1253,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  /// TAB 1: Live Screen Mirroring View with Direct Touch & Fit/Stretch Modes
+  /// TAB 1: Live Screen Mirroring View
   Widget _buildScreenMirrorTab() {
     return Container(
       key: _viewportKey,
@@ -1066,7 +1367,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             Expanded(
               child: TabBarView(
                 children: [
-                  // Tab 1: Websites & Custom Shortcuts
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -1124,7 +1424,6 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     ],
                   ),
 
-                  // Tab 2: Apps & Desktop Launcher
                   SingleChildScrollView(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1198,7 +1497,346 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  /// Bottom Navigation Bar to easily switch between Touchpad, Screen Mirror & Shortcuts
+  /// TAB 3: Administrator Portal with Password Gate (Sagiv_2311)
+  Widget _buildAdminTab() {
+    if (!_isConnected) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: const [
+              Icon(Icons.link_off, size: 48, color: Color(0xFF64748B)),
+              SizedBox(height: 12),
+              Text(
+                'Connect to PC First',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'Connect to your PC host server above before accessing the Administrator Portal.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (!_isAdminAuthenticated) {
+      return Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24.0),
+          child: Container(
+            constraints: const Box64(maxWidth: 420),
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E293B),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFF0284C7).withOpacity(0.5), width: 1.5),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 16, offset: const Offset(0, 6)),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0284C7).withOpacity(0.2),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.admin_panel_settings, size: 42, color: Color(0xFF38BDF8)),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'ADMINISTRATOR ACCESS',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Enter password to manage connected phones, disconnect devices, and apply remote locks.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                ),
+                const SizedBox(height: 20),
+
+                TextField(
+                  controller: _adminPasswordController,
+                  obscureText: _obscureAdminPassword,
+                  autofocus: false,
+                  style: const TextStyle(color: Colors.white),
+                  onSubmitted: (_) => _authenticateAdmin(),
+                  decoration: InputDecoration(
+                    labelText: 'Admin Password',
+                    prefixIcon: const Icon(Icons.vpn_key, color: Color(0xFF38BDF8), size: 18),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _obscureAdminPassword ? Icons.visibility : Icons.visibility_off,
+                        color: const Color(0xFF94A3B8),
+                        size: 18,
+                      ),
+                      onPressed: () => setState(() => _obscureAdminPassword = !_obscureAdminPassword),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: ElevatedButton(
+                    onPressed: _isAdminAuthenticating ? null : _authenticateAdmin,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0284C7),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    child: _isAdminAuthenticating
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          )
+                        : const Text('Unlock Admin Console', style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Authenticated Admin Dashboard
+    return Container(
+      color: const Color(0xFF0B1120),
+      padding: const EdgeInsets.all(14.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Admin Header Bar
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF22C55E).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.verified_user, color: Color(0xFF22C55E), size: 20),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('ADMIN CONSOLE ACTIVE', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+                    Text(
+                      '${_connectedPhones.length} Phone(s) connected to PC',
+                      style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.refresh, color: Color(0xFF38BDF8), size: 20),
+                tooltip: 'Refresh Clients List',
+                onPressed: () => _sendJson({'type': 'admin_get_clients'}),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => setState(() => _isAdminAuthenticated = false),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFEF4444),
+                  side: const BorderSide(color: Color(0xFFEF4444)),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: const Icon(Icons.lock, size: 14),
+                label: const Text('Lock', style: TextStyle(fontSize: 11)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Divider(color: Color(0xFF334155), height: 1),
+          const SizedBox(height: 12),
+
+          // Connected Devices List
+          Expanded(
+            child: _connectedPhones.isEmpty
+                ? const Center(
+                    child: Text(
+                      'No clients detected yet.\nTap refresh or wait for phone connections.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: _connectedPhones.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final phone = _connectedPhones[index];
+                      final isCurrentPhone = phone.id == _myClientId;
+
+                      return Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1E293B),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: phone.isLocked
+                                ? const Color(0xFFF59E0B)
+                                : (isCurrentPhone
+                                    ? const Color(0xFF38BDF8)
+                                    : const Color(0xFF334155)),
+                            width: phone.isLocked ? 1.5 : 1,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(
+                                  Icons.phone_android,
+                                  size: 22,
+                                  color: phone.isLocked ? const Color(0xFFF59E0B) : const Color(0xFF38BDF8),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Text(
+                                            phone.deviceName,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          if (isCurrentPhone) ...[
+                                            const SizedBox(width: 6),
+                                            Container(
+                                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                              decoration: BoxDecoration(
+                                                color: const Color(0xFF0284C7).withOpacity(0.3),
+                                                borderRadius: BorderRadius.circular(4),
+                                                border: Border.all(color: const Color(0xFF0284C7)),
+                                              ),
+                                              child: const Text('THIS DEVICE (ADMIN)', style: TextStyle(fontSize: 9, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold)),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        'IP: ${phone.ip}  •  Client #${phone.id}',
+                                        style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+
+                                // Status Badge
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: phone.isLocked
+                                        ? const Color(0xFFF59E0B).withOpacity(0.2)
+                                        : const Color(0xFF22C55E).withOpacity(0.2),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    phone.isLocked
+                                        ? (phone.lockedUntil > 0 ? 'LOCKED (TIMED)' : 'LOCKED (INDEFINITE)')
+                                        : 'ACTIVE',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: phone.isLocked ? const Color(0xFFF59E0B) : const Color(0xFF22C55E),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+
+                            const SizedBox(height: 10),
+
+                            // Action Buttons Row: Disconnect, Lock, Unlock
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                // Disconnect Button
+                                OutlinedButton.icon(
+                                  onPressed: () => _adminDisconnectPhone(phone.id, phone.deviceName),
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: const Color(0xFFEF4444),
+                                    side: const BorderSide(color: Color(0xFFEF4444)),
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                    minimumSize: Size.zero,
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                  ),
+                                  icon: const Icon(Icons.link_off, size: 14),
+                                  label: const Text('Disconnect', style: TextStyle(fontSize: 12)),
+                                ),
+
+                                const SizedBox(width: 8),
+
+                                // Lock or Unlock Toggle Button
+                                if (phone.isLocked)
+                                  ElevatedButton.icon(
+                                    onPressed: () => _adminUnlockPhone(phone.id, phone.deviceName),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: const Color(0xFF16A34A),
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                      minimumSize: Size.zero,
+                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                    ),
+                                    icon: const Icon(Icons.lock_open, size: 14),
+                                    label: const Text('Unlock Device', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                  )
+                                else
+                                  ElevatedButton.icon(
+                                    onPressed: () => _showLockDurationDialog(phone.id, phone.deviceName),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: const Color(0xFFD97706),
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                      minimumSize: Size.zero,
+                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                    ),
+                                    icon: const Icon(Icons.lock, size: 14),
+                                    label: const Text('Lock Phone', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Bottom Navigation Bar with 4 Tabs: Touchpad, Screen Mirror, Apps & Web, Admin
   Widget _buildBottomNavigationBar() {
     return Container(
       decoration: const BoxDecoration(
@@ -1225,8 +1863,16 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             icon: Icon(Icons.rocket_launch),
             label: 'Apps & Web',
           ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.admin_panel_settings),
+            label: 'Admin',
+          ),
         ],
       ),
     );
   }
+}
+
+class Box64 extends BoxConstraints {
+  const Box64({super.maxWidth});
 }

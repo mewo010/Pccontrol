@@ -443,7 +443,6 @@ fn start_udp_discovery_beacon(local_ip: String, host_name: String) {
 unsafe fn capture_screen_gdi(width: i32, height: i32) -> Option<Vec<u8>> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Graphics::Gdi::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     let hdc_screen = GetDC(null_mut());
     if hdc_screen.is_null() {
@@ -603,7 +602,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         unsafe {
             windows_sys::Win32::System::Com::CoInitializeEx(
                 std::ptr::null_mut(),
-                windows_sys::Win32::System::Com::COINIT_MULTITHREADED,
+                windows_sys::Win32::System::Com::COINIT_MULTITHREADED as u32,
             );
         }
 

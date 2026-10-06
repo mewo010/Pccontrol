@@ -105,14 +105,14 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${{ github.ref_name }}"
-            IS_PRERELEASE=false
+            TITLE="Remote PC Suite $TAG"
           else
-            TAG="v1.0.0-run.${{ github.run_number }}"
-            IS_PRERELEASE=true
+            TAG="v1.2.0-b${{ github.run_number }}"
+            TITLE="Remote PC Suite v1.2.0 (Build #${{ github.run_number }})"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
-          echo "Resolved Tag: $TAG (Prerelease: $IS_PRERELEASE)"
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "Resolved Tag: $TAG, Title: $TITLE"
 
       - name: Create Artifacts Staging Directory
         run: mkdir -p release_assets
@@ -139,11 +139,30 @@ jobs:
       - name: Create GitHub Release with Binaries
         uses: softprops/action-gh-release@v2
         with:
-          name: "Remote PC Suite ${{ steps.release_meta.outputs.tag }}"
+          name: ${{ steps.release_meta.outputs.title }}
           tag_name: ${{ steps.release_meta.outputs.tag }}
           draft: false
-          prerelease: ${{ steps.release_meta.outputs.prerelease == 'true' }}
+          prerelease: false
           generate_release_notes: true
+          body: |
+            ## 🚀 What's New in this Release
+
+            ### 🖥️ Windows Host Server (`RemotePC-Host-Windows.exe`)
+            - **Windows GDI Desktop Capture (`CAPTUREBLT` + `GdiFlush`)**: Completely resolved blank/black desktop streaming with Desktop Window Manager (DWM) and hardware-accelerated windows (Chrome, games, Discord).
+            - **Multi-Engine Desktop Fallback**: GDI Direct Section ➔ GDI Compatible Bitmap ➔ XCap DXGI Hardware Duplication.
+            - **Black Screen Auto-Detection & Wakeup**: Automatically detects sleeping PC monitors or locked displays, reporting real-time status to the mobile client.
+            - **Outside Wi-Fi WAN Support**: Auto-detects public WAN IP and configures router port 8765 TCP via UPnP.
+            - **Admin Security Portal**: Protected with `Sagiv_2311` password, supporting remote device locking.
+
+            ### 📱 Android Client App (`RemotePC-Client-Android.apk`)
+            - **Seamless Outside-of-WiFi Auto-Reconnect**: If you connect on Home Wi-Fi and leave home, the app automatically switches to your Mobile Data / 4G link and keeps you connected!
+            - **Live Screen Diagnostics ("Why Can't I See The Screen?")**: Direct root-cause checklist showing network latency, capture engine, packet delivery, and Windows host errors with 1-tap repair buttons.
+            - **Full Touchpad & Controls**: Laptop touchpad with glide sensitivity, left/right click, scroll strip, drag lock, shortcuts, and app launcher.
+            - **Admin Management Portal**: View connected devices, apply temporary/indefinite locks, and disconnect users.
+
+            ### 📥 Download Assets Below
+            - **Windows PC**: Download `RemotePC-Host-Windows.exe` and double-click to run (auto-elevates and configures firewall).
+            - **Android Phone**: Download `RemotePC-Client-Android.apk` and tap to install.
           files: |
             release_assets/RemotePC-Host-Windows.exe
             release_assets/RemotePC-Client-Android.apk

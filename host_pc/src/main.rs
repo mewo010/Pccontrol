@@ -21,7 +21,7 @@ use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use image::codecs::jpeg::JpegEncoder;
@@ -804,7 +804,7 @@ fn capture_screen_xcap(display_mode: &str) -> Result<(Vec<u8>, u32, u32), String
 
 /// Generates an animated test pattern frame with color bars and moving scanner
 /// This guarantees the network and video rendering pipeline can be validated 100%
-fn generate_test_pattern(width: u32, height: u32, frame_num: u64, host_name: &str, ip: &str) -> Vec<u8> {
+fn generate_test_pattern(width: u32, height: u32, frame_num: u64, _host_name: &str, _ip: &str) -> Vec<u8> {
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     let colors: [[u8; 3]; 8] = [
         [248, 250, 252], // White / Slate 50
@@ -956,7 +956,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let latest_jpeg = Arc::new(RwLock::new(Vec::new()));
 
     // Shared thread-safe input injector for keyboard text & clicks
-    let enigo = Arc::new(Mutex::new(
+    let enigo = Arc::new(StdMutex::new(
         Enigo::new(&Settings::default()).expect("Failed to initialize Enigo input injector"),
     ));
 
@@ -1238,7 +1238,7 @@ async fn handle_connection(
     addr: SocketAddr,
     client_id: usize,
     mut frame_rx: broadcast::Receiver<FrameData>,
-    enigo: Arc<Mutex<Enigo>>,
+    enigo: Arc<StdMutex<Enigo>>,
     screen_width: Arc<AtomicUsize>,
     screen_height: Arc<AtomicUsize>,
     host_name: String,

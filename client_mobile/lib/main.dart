@@ -29,7 +29,7 @@ class RemotePcApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0F172A),
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF38BDF8),
-          secondary: Color(0xFF818CF8),
+          secondary: Color(0xFFA855F7),
           surface: Color(0xFF1E293B),
         ),
         inputDecorationTheme: InputDecorationTheme(
@@ -118,6 +118,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   bool _isScanning = false;
   String _statusMessage = 'Tap "Auto-Detect PC" or enter IP';
   Uint8List? _latestFrameBytes;
+  bool _isScreenBlackDetected = false;
 
   int _myClientId = 0;
   String _myPersistentDeviceId = '';
@@ -130,6 +131,15 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   double _remoteHeight = 1080;
   String _hostPcName = '';
 
+  // --- Multi-Network State (Wi-Fi vs Outside-of-WiFi Internet) ---
+  String _savedLocalIp = '';
+  String _savedPublicIp = '';
+  bool _isOutsideWifiMode = false;
+  bool _autoSwitchToInternet = true;
+  bool _isAutoReconnecting = false;
+  int _autoReconnectAttempt = 0;
+  Timer? _reconnectRetryTimer;
+
   // --- Live Stream Telemetry & Debug Diagnostics ---
   String _hostCaptureEngine = 'Detecting...';
   int _hostFrameCount = 0;
@@ -137,8 +147,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   int _hostEncodeMs = 0;
   String _hostStatus = 'Connecting';
   String? _hostLastError;
-  String _hostCaptureMode = 'auto';
+  String _hostCaptureMode = 'gdi';
   int _hostFramesSent = 0;
+  String? _hostPublicIp;
 
   int _totalBinaryFramesReceived = 0;
   int _totalJsonMessagesReceived = 0;
@@ -173,6 +184,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   // Local storage files for persistence across app restarts
   File get _localLockFile => File('${Directory.systemTemp.path}/remote_pc_persistent_lock.json');
   File get _localDeviceIdFile => File('${Directory.systemTemp.path}/remote_pc_persistent_device_id.txt');
+  File get _savedProfilesFile => File('${Directory.systemTemp.path}/remote_pc_saved_profiles.json');
 
   // Custom Websites & Shortcuts
   final List<WebShortcutItem> _webShortcuts = [
@@ -189,7 +201,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   void initState() {
     super.initState();
     _initPersistentState();
-    _addLog('App initialized. Persistent ID ready.');
+    _addLog('App initialized. Device ID and Saved Network Profiles ready.');
   }
 
   void _addLog(String msg) {
@@ -204,7 +216,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     }
   }
 
-  /// Initialize persistent device ID and check if previously locked
+  /// Initialize persistent device ID, saved IP profiles, and persistent lock
   void _initPersistentState() {
     try {
       if (_localDeviceIdFile.existsSync()) {
@@ -213,6 +225,20 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       if (_myPersistentDeviceId.isEmpty) {
         _myPersistentDeviceId = 'phone_${DateTime.now().millisecondsSinceEpoch}_${DateTime.now().microsecond % 10000}';
         _localDeviceIdFile.writeAsStringSync(_myPersistentDeviceId);
+      }
+
+      // Load saved profiles (Local IP and Outside-of-WiFi Public IP)
+      if (_savedProfilesFile.existsSync()) {
+        final content = _savedProfilesFile.readAsStringSync();
+        final dynamic data = jsonDecode(content);
+        if (data is Map<String, dynamic>) {
+          _savedLocalIp = data['local_ip']?.toString() ?? '';
+          _savedPublicIp = data['public_ip']?.toString() ?? '';
+          _hostPcName = data['host_name']?.toString() ?? _hostPcName;
+          if (_savedLocalIp.isNotEmpty && !_isOutsideWifiMode) {
+            _ipController.text = _savedLocalIp;
+          }
+        }
       }
 
       if (_localLockFile.existsSync()) {
@@ -232,6 +258,17 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           }
         }
       }
+    } catch (_) {}
+  }
+
+  void _persistSavedProfile(String hostName, String localIp, String publicIp) {
+    try {
+      _savedProfilesFile.writeAsStringSync(jsonEncode({
+        'host_name': hostName,
+        'local_ip': localIp,
+        'public_ip': publicIp,
+        'last_connected': DateTime.now().millisecondsSinceEpoch,
+      }));
     } catch (_) {}
   }
 
@@ -266,6 +303,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             _isThisPhoneLocked = false;
             _persistLockState(false, 0);
             timer.cancel();
+            _showToast('Device lock has expired. Reconnected.');
           }
         });
       });
@@ -274,8 +312,11 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
   @override
   void dispose() {
-    _disconnect();
+    _pingTimer?.cancel();
+    _reconnectRetryTimer?.cancel();
     _lockCountdownTimer?.cancel();
+    _subscription?.cancel();
+    _channel?.sink.close();
     _ipController.dispose();
     _textController.dispose();
     _customAppController.dispose();
@@ -284,15 +325,16 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     super.dispose();
   }
 
-  /// Automatically discovers PC on the local Wi-Fi network using UDP broadcast beacon
+  // --- UDP Auto-Discovery Beacon on Wi-Fi ---
+
   Future<void> _autoDiscoverPc() async {
-    if (_isScanning || _isConnected) return;
+    if (_isScanning) return;
 
     setState(() {
       _isScanning = true;
-      _statusMessage = 'Searching Wi-Fi network for PC...';
+      _statusMessage = 'Searching for PC on local Wi-Fi...';
     });
-    _addLog('Scanning UDP 8766 broadcast for PC beacon...');
+    _addLog('Broadcasting UDP search on port 8766...');
 
     RawDatagramSocket? socket;
     Timer? timeoutTimer;
@@ -303,29 +345,38 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
       socket.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
-          final datagram = socket?.receive();
-          if (datagram != null) {
-            final reply = utf8.decode(datagram.data);
-            if (reply.startsWith('REMOTE_PC_HOST:')) {
-              final parts = reply.split(':');
-              if (parts.length >= 4) {
+          final dg = socket?.receive();
+          if (dg != null) {
+            final message = utf8.decode(dg.data).trim();
+            _addLog('Discovery reply received: $message');
+
+            if (message.startsWith('REMOTE_PC_HOST:')) {
+              final parts = message.split(':');
+              if (parts.length >= 3) {
                 final hostName = parts[1];
                 final hostIp = parts[2];
-                final hostPort = parts[3];
-                final fullAddress = '$hostIp:$hostPort';
+                final hostPort = parts.length >= 4 ? parts[3] : '8765';
+                final publicIpFromBeacon = parts.length >= 5 ? parts[4] : '';
+                final fullLocalAddress = '$hostIp:$hostPort';
 
                 timeoutTimer?.cancel();
                 socket?.close();
 
                 if (mounted) {
                   setState(() {
-                    _ipController.text = fullAddress;
+                    _ipController.text = fullLocalAddress;
+                    _savedLocalIp = fullLocalAddress;
+                    if (publicIpFromBeacon.isNotEmpty && publicIpFromBeacon != 'Detecting / Router IP') {
+                      _savedPublicIp = '$publicIpFromBeacon:$hostPort';
+                    }
                     _hostPcName = hostName;
                     _isScanning = false;
-                    _statusMessage = 'Found $hostName ($fullAddress)! Connecting...';
+                    _isOutsideWifiMode = false;
+                    _statusMessage = 'Found $hostName ($fullLocalAddress)! Connecting...';
                   });
-                  _addLog('Discovered host: $hostName at $fullAddress');
-                  _showToast('Found $hostName ($fullAddress)');
+                  _persistSavedProfile(hostName, fullLocalAddress, _savedPublicIp);
+                  _addLog('Discovered host: $hostName (Local: $fullLocalAddress, Public: $_savedPublicIp)');
+                  _showToast('Found $hostName ($fullLocalAddress)');
                   _connect();
                 }
               }
@@ -342,10 +393,10 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         if (mounted && _isScanning) {
           setState(() {
             _isScanning = false;
-            _statusMessage = 'No PC found automatically. Enter IP manually.';
+            _statusMessage = 'No PC found automatically. Enter IP manually or switch to Outside Wi-Fi mode.';
           });
           _addLog('Auto-discovery timed out. Enter IP manually.');
-          _showToast('No PC found. Enter IP manually or check same Wi-Fi.');
+          _showToast('No PC found on local Wi-Fi. Try Outside Wi-Fi mode or enter IP.');
         }
       });
     } catch (e) {
@@ -358,6 +409,25 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         _addLog('Auto-discovery error: $e');
       }
     }
+  }
+
+  void _switchNetworkMode(bool outsideWifi) {
+    setState(() {
+      _isOutsideWifiMode = outsideWifi;
+      if (outsideWifi) {
+        if (_savedPublicIp.isNotEmpty) {
+          _ipController.text = _savedPublicIp;
+          _showToast('Switched to Outside Wi-Fi (Mobile Data: $_savedPublicIp)');
+        } else {
+          _showToast('No public IP saved yet. Connect on Wi-Fi once or enter Public IP.');
+        }
+      } else {
+        if (_savedLocalIp.isNotEmpty) {
+          _ipController.text = _savedLocalIp;
+          _showToast('Switched to Home Wi-Fi mode');
+        }
+      }
+    });
   }
 
   void _connect() {
@@ -389,7 +459,10 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             setState(() {
               _isConnected = true;
               _isConnecting = false;
-              _statusMessage = 'Connected to ${_hostPcName.isNotEmpty ? _hostPcName : wsUrl}';
+              _isAutoReconnecting = false;
+              _autoReconnectAttempt = 0;
+              _reconnectRetryTimer?.cancel();
+              _statusMessage = 'Connected: ${_isOutsideWifiMode ? "Outside Wi-Fi / 4G" : "Local Wi-Fi"} (${_hostPcName.isNotEmpty ? _hostPcName : wsUrl})';
             });
             _addLog('WebSocket connected successfully.');
             _startPingLoop();
@@ -400,6 +473,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               'device_name': 'Android Phone',
               'device_id': _myPersistentDeviceId,
             });
+
+            // Immediately request fresh screen frame upon connection
+            _sendJson({'type': 'request_frame'});
           }
 
           if (data is Uint8List) {
@@ -426,26 +502,55 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
         },
         onError: (error) {
           _addLog('WebSocket error: $error');
-          _disconnect();
-          setState(() {
-            _statusMessage = 'Connection error: $error';
-          });
+          _handleConnectionDrop('Connection error: $error');
         },
         onDone: () {
           _addLog('WebSocket closed by host server.');
-          _disconnect();
-          setState(() {
-            _statusMessage = 'Disconnected by host';
-          });
+          _handleConnectionDrop('Disconnected by host');
         },
       );
     } catch (e) {
       _addLog('Connect exception: $e');
-      _disconnect();
-      setState(() {
-        _statusMessage = 'Failed to connect: $e';
-      });
+      _handleConnectionDrop('Failed to connect: $e');
     }
+  }
+
+  void _handleConnectionDrop(String reason) {
+    final wasConnected = _isConnected;
+    _disconnect();
+    setState(() {
+      _statusMessage = reason;
+    });
+
+    // Seamless Outside-of-WiFi Reconnect: If we were on local Wi-Fi and lost connection, auto-switch to Public IP!
+    if (wasConnected && !_isOutsideWifiMode && _savedPublicIp.isNotEmpty) {
+      _addLog('Wi-Fi connection lost. Public IP available: $_savedPublicIp. Initiating seamless Mobile Data reconnect...');
+      setState(() {
+        _isOutsideWifiMode = true;
+        _ipController.text = _savedPublicIp;
+        _isAutoReconnecting = true;
+        _autoReconnectAttempt = 1;
+        _statusMessage = 'Lost Wi-Fi. Auto-connecting via Mobile Data / Internet (Attempt 1/5)...';
+      });
+      _showToast('Lost Wi-Fi. Auto-switching to Mobile Data (Internet)...');
+      _triggerAutoReconnectLoop();
+    } else if (wasConnected && _isOutsideWifiMode && _savedPublicIp.isNotEmpty) {
+      setState(() {
+        _isAutoReconnecting = true;
+        _autoReconnectAttempt = 1;
+        _statusMessage = 'Network fluctuated. Reconnecting over Internet (Attempt 1/5)...';
+      });
+      _triggerAutoReconnectLoop();
+    }
+  }
+
+  void _triggerAutoReconnectLoop() {
+    _reconnectRetryTimer?.cancel();
+    _reconnectRetryTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (mounted && !_isConnected && !_isConnecting && _isAutoReconnecting) {
+        _connect();
+      }
+    });
   }
 
   void _disconnect() {
@@ -492,6 +597,20 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     _lastFrameReceivedTime = DateTime.now();
     _lastFrameSizeBytes = frameBytes.length;
 
+    // Check if frame bytes represent an all-black image
+    bool isBlack = false;
+    if (frameBytes.length > 500) {
+      int zeroCount = 0;
+      int testPoints = 50;
+      int step = (frameBytes.length / testPoints).floor();
+      for (int i = 100; i < frameBytes.length - 100; i += step) {
+        if (frameBytes[i] == 0) zeroCount++;
+      }
+      if (zeroCount > 45) {
+        isBlack = true;
+      }
+    }
+
     final now = DateTime.now();
     if (now.difference(_lastFpsCheck).inMilliseconds >= 1000) {
       setState(() {
@@ -503,6 +622,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
     setState(() {
       _latestFrameBytes = frameBytes;
+      _isScreenBlackDetected = isBlack;
     });
   }
 
@@ -529,8 +649,17 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             if (decoded['client_id'] != null) {
               _myClientId = (decoded['client_id'] as num).toInt();
             }
+            final pubIp = decoded['public_ip']?.toString();
+            if (pubIp != null && pubIp.isNotEmpty && pubIp != 'Detecting / Router IP') {
+              _hostPublicIp = pubIp;
+              _savedPublicIp = pubIp.contains(':') ? pubIp : '$pubIp:8765';
+            }
+            if (!_isOutsideWifiMode) {
+              _savedLocalIp = _ipController.text;
+            }
           });
-          _addLog('Host Info: $_hostPcName, ${_remoteWidth.toInt()}x${_remoteHeight.toInt()}, Client #$_myClientId');
+          _persistSavedProfile(_hostPcName, _savedLocalIp, _savedPublicIp);
+          _addLog('Host Info: $_hostPcName, ${_remoteWidth.toInt()}x${_remoteHeight.toInt()}, Client #$_myClientId (Public WAN: $_savedPublicIp)');
         } else if (type == 'capture_debug') {
           setState(() {
             _hostCaptureEngine = decoded['engine']?.toString() ?? _hostCaptureEngine;
@@ -541,6 +670,14 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             _hostLastError = decoded['last_error']?.toString();
             _hostCaptureMode = decoded['mode']?.toString() ?? _hostCaptureMode;
             _hostFramesSent = (decoded['frames_sent_to_client'] as num?)?.toInt() ?? _hostFramesSent;
+            if (decoded['is_screen_black'] == true) {
+              _isScreenBlackDetected = true;
+            }
+            final pubIp = decoded['public_ip']?.toString();
+            if (pubIp != null && pubIp.isNotEmpty && pubIp != 'Detecting / Router IP') {
+              _hostPublicIp = pubIp;
+              _savedPublicIp = pubIp.contains(':') ? pubIp : '$pubIp:8765';
+            }
             if (decoded['width'] != null && decoded['height'] != null) {
               _remoteWidth = (decoded['width'] as num).toDouble();
               _remoteHeight = (decoded['height'] as num).toDouble();
@@ -594,7 +731,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     } catch (_) {}
   }
 
-  // --- Interactive Diagnostic Controls ---
+  // --- Interactive Diagnostic & Auto-Repair Controls ---
 
   void _requestImmediateFrame() {
     _sendJson({'type': 'request_frame'});
@@ -605,13 +742,35 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
   void _requestTestPattern() {
     _sendJson({'type': 'request_test_frame'});
     _addLog('Requested diagnostic Test Frame pattern.');
-    _showToast('Requesting test pattern frame...');
+    _showToast('Showing color test pattern on phone...');
   }
 
-  void _setCaptureMode(String mode) {
-    _sendJson({'type': 'set_capture_mode', 'mode': mode});
-    _addLog('Switched capture mode to: $mode');
-    _showToast('Setting capture mode: $mode');
+  void _forceGdiCapture() {
+    _sendJson({'type': 'set_capture_mode', 'mode': 'gdi'});
+    _sendJson({'type': 'request_frame'});
+    _addLog('Auto-Fix: Forced Windows GDI BitBlt desktop capture.');
+    _showToast('Forced Windows GDI Direct desktop capture!');
+  }
+
+  void _forceDxgiCapture() {
+    _sendJson({'type': 'set_capture_mode', 'mode': 'xcap'});
+    _sendJson({'type': 'request_frame'});
+    _addLog('Switched capture engine to XCap Hardware DXGI.');
+    _showToast('Switched to XCap DXGI Hardware capture.');
+  }
+
+  void _cycleDisplay() {
+    _sendJson({'type': 'cycle_display'});
+    _sendJson({'type': 'request_frame'});
+    _addLog('Toggled monitor between Primary and Virtual all-displays.');
+    _showToast('Switched monitor display target!');
+  }
+
+  void _wakeDisplay() {
+    _sendJson({'type': 'wake_display'});
+    _sendJson({'type': 'request_frame'});
+    _addLog('Sent display wake signal to PC.');
+    _showToast('Sent wake signal to PC display!');
   }
 
   void _showDiagnosticsLogSheet() {
@@ -630,19 +789,13 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Row(
-                    children: const [
-                      Icon(Icons.terminal, color: Color(0xFF38BDF8), size: 20),
-                      SizedBox(width: 8),
-                      Text(
-                        'Live Event & Frame Diagnostics',
-                        style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
-                      ),
-                    ],
+                  const Text(
+                    'Real-Time Event Logs',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.copy, color: Color(0xFF94A3B8), size: 18),
-                    tooltip: 'Copy all logs',
+                  TextButton.icon(
+                    icon: const Icon(Icons.copy, size: 16, color: Color(0xFF38BDF8)),
+                    label: const Text('Copy Logs', style: TextStyle(color: Color(0xFF38BDF8))),
                     onPressed: () {
                       Clipboard.setData(ClipboardData(text: _debugLogs.join('\n')));
                       _showToast('Copied logs to clipboard');
@@ -652,35 +805,22 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               ),
               const Divider(color: Color(0xFF334155)),
               Expanded(
-                child: _debugLogs.isEmpty
-                    ? const Center(
-                        child: Text('No logs recorded yet.', style: TextStyle(color: Color(0xFF64748B))),
-                      )
-                    : ListView.builder(
-                        itemCount: _debugLogs.length,
-                        itemBuilder: (context, idx) {
-                          final log = _debugLogs[_debugLogs.length - 1 - idx];
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 2.0),
-                            child: Text(
-                              log,
-                              style: const TextStyle(
-                                color: Color(0xFFCBD5E1),
-                                fontFamily: 'monospace',
-                                fontSize: 11,
-                              ),
-                            ),
-                          );
-                        },
+                child: ListView.builder(
+                  itemCount: _debugLogs.length,
+                  itemBuilder: (context, index) {
+                    final log = _debugLogs[_debugLogs.length - 1 - index];
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2.0),
+                      child: Text(
+                        log,
+                        style: const TextStyle(
+                          color: Color(0xFF94A3B8),
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                        ),
                       ),
-              ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E293B)),
-                  onPressed: () => Navigator.pop(ctx),
-                  child: const Text('Close Log Viewer', style: TextStyle(color: Colors.white)),
+                    );
+                  },
                 ),
               ),
             ],
@@ -690,12 +830,81 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  // --- Mouse & Keyboard Actions ---
+  void _showOutsideWifiGuideDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Row(
+          children: const [
+            Icon(Icons.public, color: Color(0xFFA855F7), size: 22),
+            SizedBox(width: 8),
+            Text('Connect Outside of Wi-Fi', style: TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'How to connect outside your house:',
+              style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF38BDF8), fontSize: 13),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '1. Connect once while on your Home Wi-Fi.\n'
+              '   Your phone automatically learns your PC\'s Public WAN IP.\n\n'
+              '2. Leave home or turn off Wi-Fi (switch to 4G/5G).\n'
+              '   The app will automatically failover to your Mobile Data link!\n\n'
+              '3. Or select "Outside Wi-Fi" tab and tap Connect.\n'
+              '   Your router\'s Port 8765 TCP is auto-forwarded via UPnP by the PC host.',
+              style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 12),
+            ),
+            if (_savedPublicIp.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFA855F7).withOpacity(0.5)),
+                ),
+                child: Text(
+                  'Saved Public WAN IP: $_savedPublicIp',
+                  style: const TextStyle(color: Color(0xFFA855F7), fontSize: 12, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Got it', style: TextStyle(color: Color(0xFF38BDF8))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showToast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        backgroundColor: const Color(0xFF1E293B),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  // --- Input and Mouse Event Handlers ---
 
   void _handleTrackpadMove(DragUpdateDetails details) {
     if (_isThisPhoneLocked) return;
-    final dx = details.delta.dx * _trackpadSensitivity;
-    final dy = details.delta.dy * _trackpadSensitivity;
+    final double dx = details.delta.dx * _trackpadSensitivity;
+    final double dy = details.delta.dy * _trackpadSensitivity;
     _sendJson({'type': 'move_relative', 'dx': dx, 'dy': dy});
   }
 
@@ -709,18 +918,12 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     if (_isThisPhoneLocked) return;
     _sendJson({'type': 'click', 'button': 'right'});
     HapticFeedback.mediumImpact();
-    _showToast('Right clicked');
   }
 
   void _handleDoubleClick() {
     if (_isThisPhoneLocked) return;
     _sendJson({'type': 'double_click', 'button': 'left'});
-    HapticFeedback.selectionClick();
-  }
-
-  void _handleScroll(int dy) {
-    if (_isThisPhoneLocked) return;
-    _sendJson({'type': 'scroll', 'dy': dy});
+    HapticFeedback.heavyImpact();
   }
 
   void _toggleDragLock() {
@@ -730,58 +933,124 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     });
     if (_isDragLocked) {
       _sendJson({'type': 'mouse_down', 'button': 'left'});
-      _showToast('Drag locked (mouse held down)');
+      HapticFeedback.heavyImpact();
+      _showToast('Drag Lock Active (Mouse Down)');
     } else {
       _sendJson({'type': 'mouse_up', 'button': 'left'});
-      _showToast('Drag released');
+      HapticFeedback.lightImpact();
+      _showToast('Drag Lock Released');
     }
-    HapticFeedback.mediumImpact();
   }
 
-  void _sendTypingText() {
+  void _handleScroll(int dy) {
     if (_isThisPhoneLocked) return;
-    final text = _textController.text;
-    if (text.isEmpty) return;
-    _sendJson({'type': 'type', 'text': text});
-    _textController.clear();
+    _sendJson({'type': 'scroll', 'dy': dy});
+    HapticFeedback.selectionClick();
   }
 
   void _sendKey(String key) {
     if (_isThisPhoneLocked) return;
     _sendJson({'type': 'key', 'key': key});
-    if (key == 'win') {
-      _showToast('Toggled Windows Start Menu');
-    }
+    HapticFeedback.selectionClick();
   }
 
-  void _openWebUrl(String url) {
+  void _sendText(String text) {
+    if (_isThisPhoneLocked || text.isEmpty) return;
+    _sendJson({'type': 'type', 'text': text});
+    _textController.clear();
+  }
+
+  void _openUrl(String url) {
     if (_isThisPhoneLocked) return;
     _sendJson({'type': 'open_url', 'url': url});
-    _showToast('Opening $url on PC');
+    _showToast('Opening $url on PC...');
   }
 
   void _launchApp(String app) {
-    if (_isThisPhoneLocked || app.trim().isEmpty) return;
-    _sendJson({'type': 'launch_app', 'app': app.trim()});
-    _showToast('Launching $app on PC');
+    if (_isThisPhoneLocked) return;
+    _sendJson({'type': 'launch_app', 'app': app});
+    _showToast('Launching $app on PC...');
   }
 
-  void _authenticateAdmin() {
-    final pass = _adminPasswordController.text;
-    if (pass.isEmpty) {
-      _showToast('Please enter administrator password');
-      return;
-    }
+  // --- Admin Dialogs ---
+
+  void _showAdminLoginDialog() {
+    _adminPasswordController.clear();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Row(
+          children: const [
+            Icon(Icons.admin_panel_settings, color: Color(0xFF38BDF8), size: 24),
+            SizedBox(width: 8),
+            Text('Admin Portal Login', style: TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter administrator password to manage connected phones, disconnect devices, and apply locks.',
+              style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _adminPasswordController,
+              obscureText: _obscureAdminPassword,
+              autofocus: true,
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                labelText: 'Password',
+                suffixIcon: IconButton(
+                  icon: Icon(
+                    _obscureAdminPassword ? Icons.visibility_off : Icons.visibility,
+                    color: const Color(0xFF94A3B8),
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _obscureAdminPassword = !_obscureAdminPassword;
+                    });
+                  },
+                ),
+              ),
+              onSubmitted: (_) {
+                Navigator.pop(ctx);
+                _submitAdminAuth();
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _submitAdminAuth();
+            },
+            child: const Text('Unlock Admin'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _submitAdminAuth() {
+    final pass = _adminPasswordController.text.trim();
+    if (pass.isEmpty) return;
+
     setState(() {
       _isAdminAuthenticating = true;
     });
-    _sendJson({
-      'type': 'admin_auth',
-      'password': pass,
-    });
+    _sendJson({'type': 'admin_auth', 'password': pass});
   }
 
-  void _showLockDurationPicker(int targetId, String phoneName) {
+  void _showLockDurationDialog(int targetId, String phoneName) {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1E293B),
@@ -987,78 +1256,25 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                 _showToast('Added shortcut: $name');
               }
             },
-            child: const Text('Add', style: TextStyle(color: Colors.white)),
+            child: const Text('Save Shortcut'),
           ),
         ],
       ),
     );
   }
 
-  void _showToast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
-    );
-  }
-
-  // --- UI Build ---
+  // --- Root Widget Tree ---
 
   @override
   Widget build(BuildContext context) {
-    // If this phone is currently locked by PC Administrator, show full-screen lock overlay
     if (_isThisPhoneLocked) {
-      return Scaffold(
-        backgroundColor: const Color(0xFF0B1120),
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(28.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFEF4444).withOpacity(0.15),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFFEF4444), width: 2),
-                  ),
-                  child: const Icon(Icons.lock_person, size: 64, color: Color(0xFFEF4444)),
-                ),
-                const SizedBox(height: 24),
-                const Text(
-                  'PHONE ACCESS LOCKED',
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.5,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  _thisPhoneLockedUntil > 0
-                      ? 'The PC Administrator locked access for this phone.\nUnlocks automatically in: ${_remainingLockSeconds ~/ 60}m ${_remainingLockSeconds % 60}s'
-                      : 'The PC Administrator locked access for this phone indefinitely.\nWaiting for administrator to unlock...',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 14, height: 1.5),
-                ),
-                const SizedBox(height: 20),
-                const Text(
-                  'Closing and reopening the app will keep you locked until the timer expires.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
+      return _buildLockedScreen();
     }
 
     return Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF0F172A),
         elevation: 0,
-        titleSpacing: 10,
         title: Row(
           children: [
             Container(
@@ -1066,25 +1282,35 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               height: 10,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: _isConnected
-                    ? const Color(0xFF22C55E)
-                    : (_isConnecting ? const Color(0xFFF59E0B) : const Color(0xFFEF4444)),
+                color: _isConnected ? const Color(0xFF22C55E) : const Color(0xFFEF4444),
               ),
             ),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(
-                _isConnected
-                    ? (_hostPcName.isNotEmpty ? _hostPcName : 'Connected to PC')
-                    : 'Remote PC Controller',
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                overflow: TextOverflow.ellipsis,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _hostPcName.isNotEmpty ? _hostPcName : 'Remote PC Control',
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    _statusMessage,
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: _isConnected ? const Color(0xFF38BDF8) : const Color(0xFF94A3B8),
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ),
             ),
           ],
         ),
         actions: [
-          if (!_isConnected)
+          if (!_isOutsideWifiMode)
             TextButton.icon(
               onPressed: _isScanning ? null : _autoDiscoverPc,
               icon: _isScanning
@@ -1095,10 +1321,15 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     )
                   : const Icon(Icons.wifi_find, size: 18, color: Color(0xFF38BDF8)),
               label: Text(
-                _isScanning ? 'Searching...' : 'Auto-Detect PC',
+                _isScanning ? 'Searching...' : 'Auto-Detect',
                 style: const TextStyle(color: Color(0xFF38BDF8), fontSize: 13, fontWeight: FontWeight.bold),
               ),
             ),
+          IconButton(
+            icon: const Icon(Icons.public, color: Color(0xFFA855F7)),
+            tooltip: 'Outside Wi-Fi Guide',
+            onPressed: _showOutsideWifiGuideDialog,
+          ),
           IconButton(
             icon: Icon(_isConnected ? Icons.link_off : Icons.link, color: _isConnected ? const Color(0xFFEF4444) : const Color(0xFF38BDF8)),
             tooltip: _isConnected ? 'Disconnect' : 'Connect',
@@ -1128,7 +1359,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           setState(() {
             _currentTabIndex = index;
           });
-          // When switching to Screen Mirror tab, immediately request a frame so it renders with 0 delay!
+          // When switching to Screen Mirror tab, immediately request a frame so it renders instantly
           if (index == 1 && _isConnected) {
             _sendJson({'type': 'request_frame'});
           }
@@ -1165,50 +1396,125 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     return Container(
       color: const Color(0xFF1E293B),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      child: Row(
+      child: Column(
         children: [
-          Expanded(
-            child: SizedBox(
-              height: 38,
-              child: TextField(
-                controller: _ipController,
-                style: const TextStyle(fontSize: 13, color: Colors.white),
-                decoration: const InputDecoration(
-                  hintText: 'Enter PC IP (e.g. 192.168.1.5:8765)',
-                  prefixIcon: Icon(Icons.laptop, size: 16, color: Color(0xFF94A3B8)),
-                  contentPadding: EdgeInsets.symmetric(vertical: 0, horizontal: 8),
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 38,
+                  child: TextField(
+                    controller: _ipController,
+                    style: const TextStyle(fontSize: 13, color: Colors.white),
+                    decoration: InputDecoration(
+                      hintText: _isOutsideWifiMode ? 'Enter Public IP (e.g. 84.110.x.x:8765)' : 'Enter PC IP (e.g. 192.168.1.5:8765)',
+                      prefixIcon: Icon(_isOutsideWifiMode ? Icons.public : Icons.wifi, size: 16, color: _isOutsideWifiMode ? const Color(0xFFA855F7) : const Color(0xFF38BDF8)),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 8),
+                    ),
+                  ),
                 ),
               ),
-            ),
+              const SizedBox(width: 8),
+              ElevatedButton(
+                onPressed: _isConnecting ? null : (_isConnected ? _disconnect : _connect),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _isConnected ? const Color(0xFF334155) : (_isOutsideWifiMode ? const Color(0xFF7E22CE) : const Color(0xFF0284C7)),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                ),
+                child: Text(
+                  _isConnected ? 'Disconnect' : (_isConnecting ? 'Connecting...' : 'Connect'),
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                ),
+              ),
+              if (_isConnected) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF334155)),
+                  ),
+                  child: Text(
+                    '${_renderedFps} FPS | ${_latencyMs}ms',
+                    style: const TextStyle(fontSize: 11, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ],
           ),
-          const SizedBox(width: 8),
-          ElevatedButton(
-            onPressed: _isConnecting ? null : (_isConnected ? _disconnect : _connect),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: _isConnected ? const Color(0xFF334155) : const Color(0xFF0284C7),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            ),
-            child: Text(
-              _isConnected ? 'Disconnect' : (_isConnecting ? 'Connecting...' : 'Connect'),
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-            ),
-          ),
-          if (_isConnected) ...[
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0F172A),
+          const SizedBox(height: 6),
+          // Network Mode Switcher: Wi-Fi vs Outside Wi-Fi (Mobile Data)
+          Row(
+            children: [
+              InkWell(
+                onTap: () => _switchNetworkMode(false),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF334155)),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: !_isOutsideWifiMode ? const Color(0xFF0284C7).withOpacity(0.3) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: !_isOutsideWifiMode ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      Icon(Icons.wifi, size: 12, color: Color(0xFF38BDF8)),
+                      SizedBox(width: 4),
+                      Text('Home Wi-Fi', style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
               ),
-              child: Text(
-                '${_renderedFps} FPS | ${_latencyMs}ms',
-                style: const TextStyle(fontSize: 11, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold),
+              const SizedBox(width: 6),
+              InkWell(
+                onTap: () => _switchNetworkMode(true),
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: _isOutsideWifiMode ? const Color(0xFF9333EA).withOpacity(0.3) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: _isOutsideWifiMode ? const Color(0xFFA855F7) : const Color(0xFF334155)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.public, size: 12, color: Color(0xFFA855F7)),
+                      const SizedBox(width: 4),
+                      Text(
+                        _savedPublicIp.isNotEmpty ? 'Outside Wi-Fi (Saved)' : 'Outside Wi-Fi',
+                        style: const TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-            ),
-          ],
+              const Spacer(),
+              if (_isAutoReconnecting)
+                Row(
+                  children: [
+                    const SizedBox(
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFA855F7)),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Reconnecting (4G)...',
+                      style: const TextStyle(color: Color(0xFFA855F7), fontSize: 10, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                )
+              else if (_savedPublicIp.isNotEmpty)
+                Text(
+                  'Auto-reconnects on 4G/5G',
+                  style: TextStyle(color: const Color(0xFF94A3B8).withOpacity(0.8), fontSize: 10),
+                ),
+            ],
+          ),
         ],
       ),
     );
@@ -1477,7 +1783,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  /// TAB 1: Live Screen Mirroring View with Real-Time Diagnostics
+  /// TAB 1: Live Screen Mirroring View with "Why Can't I See The Screen?" Root-Cause Diagnosis
   Widget _buildScreenMirrorTab() {
     return Container(
       key: _viewportKey,
@@ -1515,7 +1821,53 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                           ),
                   ),
                 )
-              : _buildDiagnosticWaitingCenter(),
+              : _buildRootCauseDiagnosticCenter(),
+
+          // Floating Warning Banner if Screen Content is Pitch Black
+          if (_latestFrameBytes != null && _isScreenBlackDetected)
+            Positioned(
+              left: 16,
+              bottom: 16,
+              right: 16,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B).withOpacity(0.95),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFF59E0B)),
+                  boxShadow: [
+                    BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10),
+                  ],
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, color: Color(0xFFF59E0B), size: 22),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: const [
+                          Text('Desktop screen appears pitch black', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                          Text('PC monitor may be asleep, locked, or on secondary display.', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 10)),
+                        ],
+                      ),
+                    ),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0284C7),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      ),
+                      onPressed: () {
+                        _wakeDisplay();
+                        _cycleDisplay();
+                      },
+                      child: const Text('Wake / Fix', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
 
           // Floating Controls Bar (Top Right)
           Positioned(
@@ -1524,7 +1876,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Live Debug HUD Toggle Button
+                // "Why Can't I See The Screen?" Root-Cause Diagnosis Toggle
                 InkWell(
                   onTap: () => setState(() => _showDebugHud = !_showDebugHud),
                   borderRadius: BorderRadius.circular(8),
@@ -1542,10 +1894,10 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Icon(Icons.bug_report, size: 14, color: Color(0xFF38BDF8)),
+                        const Icon(Icons.troubleshoot, size: 14, color: Color(0xFF38BDF8)),
                         const SizedBox(width: 4),
                         Text(
-                          _showDebugHud ? 'Hide Debug' : 'Debug HUD',
+                          _showDebugHud ? 'Hide Diagnosis' : 'Screen Diagnostics',
                           style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
                         ),
                       ],
@@ -1607,49 +1959,54 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  /// Live Streaming & Diagnostics Center shown when waiting for video frames
-  Widget _buildDiagnosticWaitingCenter() {
+  /// DIRECT ROOT-CAUSE DIAGNOSIS: Explains WHY the user cannot see the screen and offers 1-tap auto repairs
+  Widget _buildRootCauseDiagnosticCenter() {
+    final bool networkOk = _isConnected;
+    final bool framesArriving = _totalBinaryFramesReceived > 0;
+    final bool pcCapturing = _hostFrameCount > 0;
+
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20.0),
+        padding: const EdgeInsets.all(16.0),
         child: Container(
-          constraints: const BoxConstraints(maxWidth: 520),
+          constraints: const BoxConstraints(maxWidth: 540),
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
             color: const Color(0xFF1E293B),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: const Color(0xFF334155)),
+            border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.4)),
             boxShadow: [
-              BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 16, offset: const Offset(0, 4)),
+              BoxShadow(color: Colors.black.withOpacity(0.6), blurRadius: 20, offset: const Offset(0, 6)),
             ],
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Header Status
+              // Header
               Row(
                 children: [
-                  const SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(strokeWidth: 3, color: Color(0xFF38BDF8)),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0284C7).withOpacity(0.2),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.troubleshoot, color: Color(0xFF38BDF8), size: 24),
                   ),
-                  const SizedBox(width: 14),
+                  const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
+                      children: const [
                         Text(
-                          _isConnected ? 'Streaming PC Desktop Screen...' : _statusMessage,
-                          style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold),
+                          "WHY CAN'T I SEE THE SCREEN?",
+                          style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1),
                         ),
-                        const SizedBox(height: 2),
+                        SizedBox(height: 2),
                         Text(
-                          _isConnected
-                              ? 'Connected to ${_hostPcName.isNotEmpty ? _hostPcName : "PC"} • Waiting for video frames'
-                              : 'Connect to host to start screen mirroring',
-                          style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                          'Live Pipeline Diagnostic & 1-Tap Auto-Repair Center',
+                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
                         ),
                       ],
                     ),
@@ -1661,114 +2018,155 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
               const Divider(color: Color(0xFF334155)),
               const SizedBox(height: 8),
 
-              // Telemetry Grid
-              Row(
-                children: [
-                  Expanded(
-                    child: _buildTelemetryMetric(
-                      'Host Engine',
-                      _hostCaptureEngine,
-                      icon: Icons.computer,
-                      color: const Color(0xFF38BDF8),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildTelemetryMetric(
-                      'Host Captured',
-                      '$_hostFrameCount frames',
-                      icon: Icons.movie_creation,
-                      color: _hostFrameCount > 0 ? const Color(0xFF22C55E) : const Color(0xFFF59E0B),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                    child: _buildTelemetryMetric(
-                      'Host Sent',
-                      '$_hostFramesSent frames',
-                      icon: Icons.upload,
-                      color: const Color(0xFF818CF8),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildTelemetryMetric(
-                      'Phone Received',
-                      '$_totalBinaryFramesReceived frames',
-                      icon: Icons.download,
-                      color: _totalBinaryFramesReceived > 0 ? const Color(0xFF22C55E) : const Color(0xFFEF4444),
-                    ),
-                  ),
-                ],
+              // Checklist Item 1: Network Connection
+              _buildDiagnosticCheckItem(
+                title: '1. Phone-to-PC Network Connection',
+                statusOk: networkOk,
+                statusText: networkOk
+                    ? 'Connected to ${_isOutsideWifiMode ? "Outside Wi-Fi (WAN)" : "Home Wi-Fi"} (${_ipController.text}) • Latency: ${_latencyMs}ms'
+                    : 'Not connected to PC server. Connect via Home Wi-Fi or Outside Wi-Fi first.',
+                explanation: !networkOk
+                    ? 'Ensure PC host server is running and port 8765 is accessible.'
+                    : null,
               ),
 
-              // Warning or error banner if host reported an issue
-              if (_hostLastError != null && _hostLastError!.isNotEmpty) ...[
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFEF4444).withOpacity(0.15),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.5)),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.warning_amber, color: Color(0xFFEF4444), size: 18),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Host Diagnostic: $_hostLastError',
-                          style: const TextStyle(color: Color(0xFFFCA5A5), fontSize: 11),
-                        ),
-                      ),
-                    ],
+              const SizedBox(height: 8),
+
+              // Checklist Item 2: PC Desktop Capture Engine
+              _buildDiagnosticCheckItem(
+                title: '2. PC Desktop Capture Engine',
+                statusOk: pcCapturing,
+                statusText: pcCapturing
+                    ? 'Host produced $_hostFrameCount frames via $_hostCaptureEngine (${_remoteWidth.toInt()}x${_remoteHeight.toInt()})'
+                    : 'PC capture engine has not produced desktop buffer yet (0 frames)',
+                explanation: !pcCapturing
+                    ? 'Windows GDI BitBlt or DirectX duplication is initializing. Tap "Force GDI Desktop Capture" below.'
+                    : null,
+              ),
+
+              const SizedBox(height: 8),
+
+              // Checklist Item 3: Video Frame Delivery
+              _buildDiagnosticCheckItem(
+                title: '3. Video Packet Delivery to Phone',
+                statusOk: framesArriving,
+                statusText: framesArriving
+                    ? '$_totalBinaryFramesReceived video frames received (${(_totalBytesReceived / 1024).toStringAsFixed(1)} KB)'
+                    : (networkOk ? 'Connected, but waiting for video stream packets from PC' : 'Awaiting network connection'),
+                explanation: (networkOk && !framesArriving)
+                    ? 'The PC is capturing, but binary image frames have not arrived. Tap "Request Frame Now" or "Show Test Color Pattern" below.'
+                    : null,
+              ),
+
+              const SizedBox(height: 8),
+
+              // Checklist Item 4: Exact Host Windows Error / Status
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: (_hostLastError != null && _hostLastError!.isNotEmpty)
+                        ? const Color(0xFFEF4444).withOpacity(0.6)
+                        : const Color(0xFF334155),
                   ),
                 ),
-              ],
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          (_hostLastError != null && _hostLastError!.isNotEmpty)
+                              ? Icons.error_outline
+                              : Icons.info_outline,
+                          size: 16,
+                          color: (_hostLastError != null && _hostLastError!.isNotEmpty)
+                              ? const Color(0xFFEF4444)
+                              : const Color(0xFF38BDF8),
+                        ),
+                        const SizedBox(width: 6),
+                        const Text(
+                          'Windows Host Status & Error Detail:',
+                          style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      (_hostLastError != null && _hostLastError!.isNotEmpty)
+                          ? _hostLastError!
+                          : (_hostFrameCount > 0
+                              ? 'Active Engine: $_hostCaptureEngine ($_hostStatus)'
+                              : 'Initializing Windows GDI Direct DIBSection with CAPTUREBLT...'),
+                      style: TextStyle(
+                        color: (_hostLastError != null && _hostLastError!.isNotEmpty)
+                            ? const Color(0xFFFCA5A5)
+                            : const Color(0xFF94A3B8),
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
 
               const SizedBox(height: 16),
 
-              // Action Buttons
+              // 1-Tap Action Repairs
+              const Text(
+                '1-TAP AUTO-REPAIR ACTIONS:',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1),
+              ),
+              const SizedBox(height: 8),
+
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
-                alignment: WrapAlignment.center,
                 children: [
                   ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF0284C7),
                       foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     ),
-                    onPressed: _isConnected ? _requestImmediateFrame : null,
-                    icon: const Icon(Icons.refresh, size: 16),
-                    label: const Text('Request Frame Now', style: TextStyle(fontSize: 12)),
-                  ),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF334155),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    ),
-                    onPressed: _isConnected ? () => _setCaptureMode('gdi') : null,
-                    icon: const Icon(Icons.switch_video, size: 16),
-                    label: const Text('Force GDI BitBlt Mode', style: TextStyle(fontSize: 12)),
+                    onPressed: _isConnected ? _forceGdiCapture : null,
+                    icon: const Icon(Icons.build_circle, size: 18),
+                    label: const Text('AUTO-FIX: Force GDI Desktop Capture', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                   ),
                   ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF1E293B),
                       foregroundColor: const Color(0xFF38BDF8),
                       side: const BorderSide(color: Color(0xFF38BDF8)),
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    ),
+                    onPressed: _isConnected ? _wakeDisplay : null,
+                    icon: const Icon(Icons.wb_sunny, size: 18),
+                    label: const Text('Wake PC Sleeping Screen', style: TextStyle(fontSize: 12)),
+                  ),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1E293B),
+                      foregroundColor: const Color(0xFFA855F7),
+                      side: const BorderSide(color: Color(0xFFA855F7)),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    ),
+                    onPressed: _isConnected ? _cycleDisplay : null,
+                    icon: const Icon(Icons.connected_tv, size: 18),
+                    label: const Text('Switch Primary / Virtual Display', style: TextStyle(fontSize: 12)),
+                  ),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1E293B),
+                      foregroundColor: const Color(0xFF22C55E),
+                      side: const BorderSide(color: Color(0xFF22C55E)),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     ),
                     onPressed: _isConnected ? _requestTestPattern : null,
-                    icon: const Icon(Icons.palette, size: 16),
-                    label: const Text('Show Test Pattern', style: TextStyle(fontSize: 12)),
+                    icon: const Icon(Icons.palette, size: 18),
+                    label: const Text('Test Video Link: Show Color Pattern', style: TextStyle(fontSize: 12)),
                   ),
                   OutlinedButton.icon(
                     style: OutlinedButton.styleFrom(
@@ -1778,7 +2176,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     ),
                     onPressed: _showDiagnosticsLogSheet,
                     icon: const Icon(Icons.terminal, size: 16),
-                    label: const Text('View Event Logs', style: TextStyle(fontSize: 12)),
+                    label: const Text('View Raw Event Logs', style: TextStyle(fontSize: 12)),
                   ),
                 ],
               ),
@@ -1789,32 +2187,59 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  Widget _buildTelemetryMetric(String label, String value, {required IconData icon, required Color color}) {
+  Widget _buildDiagnosticCheckItem({
+    required String title,
+    required bool statusOk,
+    required String statusText,
+    String? explanation,
+  }) {
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: const Color(0xFF0F172A),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF334155)),
+        border: Border.all(color: statusOk ? const Color(0xFF22C55E).withOpacity(0.5) : const Color(0xFFF59E0B).withOpacity(0.5)),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 18, color: color),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 10)),
-                const SizedBox(height: 2),
-                Text(
-                  value,
-                  style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.bold),
-                  overflow: TextOverflow.ellipsis,
+          Row(
+            children: [
+              Icon(
+                statusOk ? Icons.check_circle : Icons.warning_amber_rounded,
+                size: 16,
+                color: statusOk ? const Color(0xFF22C55E) : const Color(0xFFF59E0B),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
                 ),
-              ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Padding(
+            padding: const EdgeInsets.only(left: 24.0),
+            child: Text(
+              statusText,
+              style: TextStyle(
+                color: statusOk ? const Color(0xFF22C55E) : const Color(0xFFF59E0B),
+                fontSize: 11,
+              ),
             ),
           ),
+          if (explanation != null) ...[
+            const SizedBox(height: 2),
+            Padding(
+              padding: const EdgeInsets.only(left: 24.0),
+              child: Text(
+                explanation,
+                style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 10),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1824,7 +2249,7 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F172A).withOpacity(0.92),
+        color: const Color(0xFF0F172A).withOpacity(0.95),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.6)),
         boxShadow: [
@@ -1840,10 +2265,10 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             children: [
               Row(
                 children: const [
-                  Icon(Icons.monitor_heart, color: Color(0xFF38BDF8), size: 16),
+                  Icon(Icons.troubleshoot, color: Color(0xFF38BDF8), size: 16),
                   SizedBox(width: 6),
                   Text(
-                    'STREAM TELEMETRY & ENGINE DIAGNOSTICS',
+                    'SCREEN PIPELINE DIAGNOSTICS',
                     style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
                   ),
                 ],
@@ -1868,9 +2293,14 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             '• Host Captured: $_hostFrameCount | Host Sent: $_hostFramesSent | Phone Recv: $_totalBinaryFramesReceived',
             style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 11),
           ),
+          if (_savedPublicIp.isNotEmpty)
+            Text(
+              '• Public Internet WAN: $_savedPublicIp (${_isOutsideWifiMode ? "Active" : "Ready"})',
+              style: const TextStyle(color: Color(0xFFA855F7), fontSize: 11),
+            ),
           if (_hostLastError != null && _hostLastError!.isNotEmpty)
             Text(
-              '• Host Warning: $_hostLastError',
+              '• Host Notice: $_hostLastError',
               style: const TextStyle(color: Color(0xFFF87171), fontSize: 11),
             ),
 
@@ -1878,17 +2308,19 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
           Row(
             children: [
               const Text('Engine: ', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11)),
-              _buildHudModeBtn('Auto', 'auto'),
-              const SizedBox(width: 4),
               _buildHudModeBtn('GDI BitBlt', 'gdi'),
               const SizedBox(width: 4),
-              _buildHudModeBtn('XCap DXGI', 'xcap'),
+              _buildHudModeBtn('DXGI HW', 'xcap'),
               const SizedBox(width: 4),
               _buildHudModeBtn('Test Pattern', 'test_pattern'),
               const Spacer(),
-              TextButton(
-                onPressed: _showDiagnosticsLogSheet,
-                child: const Text('View Logs', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 11)),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF0284C7),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                ),
+                onPressed: _requestImmediateFrame,
+                child: const Text('Refresh Frame', style: TextStyle(fontSize: 10)),
               ),
             ],
           ),
@@ -1897,204 +2329,142 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     );
   }
 
-  Widget _buildHudModeBtn(String label, String mode) {
-    final isSelected = _hostCaptureMode == mode;
+  Widget _buildHudModeBtn(String label, String modeVal) {
+    final isSel = _hostCaptureMode == modeVal;
     return InkWell(
-      onTap: () => _setCaptureMode(mode),
+      onTap: () {
+        _sendJson({'type': 'set_capture_mode', 'mode': modeVal});
+        _sendJson({'type': 'request_frame'});
+        setState(() => _hostCaptureMode = modeVal);
+        _showToast('Switched engine to $label');
+      },
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF0284C7) : const Color(0xFF1E293B),
+          color: isSel ? const Color(0xFF0284C7) : const Color(0xFF1E293B),
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: isSelected ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
+          border: Border.all(color: isSel ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
         ),
-        child: Text(
-          label,
-          style: TextStyle(color: isSelected ? Colors.white : const Color(0xFF94A3B8), fontSize: 10, fontWeight: FontWeight.bold),
-        ),
+        child: Text(label, style: TextStyle(fontSize: 10, color: isSel ? Colors.white : const Color(0xFF94A3B8))),
       ),
     );
   }
 
-  /// TAB 2: Websites, Custom Shortcuts & PC App Launcher
+  /// TAB 2: Apps & Web Shortcuts
   Widget _buildShortcutsAndAppsTab() {
     return Container(
-      color: const Color(0xFF0B1120),
-      padding: const EdgeInsets.all(14.0),
-      child: DefaultTabController(
-        length: 2,
-        child: Column(
-          children: [
-            const TabBar(
-              indicatorColor: Color(0xFF38BDF8),
-              labelColor: Color(0xFF38BDF8),
-              unselectedLabelColor: Color(0xFF94A3B8),
-              tabs: [
-                Tab(icon: Icon(Icons.language), text: 'Websites & Shortcuts'),
-                Tab(icon: Icon(Icons.apps), text: 'PC & Desktop Apps'),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: TabBarView(
-                children: [
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('QUICK WEB SHORTCUTS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                          TextButton.icon(
-                            onPressed: _showAddShortcutDialog,
-                            icon: const Icon(Icons.add, size: 16, color: Color(0xFF38BDF8)),
-                            label: const Text('Add Custom Site', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 12)),
-                          ),
-                        ],
-                      ),
-                      Expanded(
-                        child: GridView.builder(
-                          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                            crossAxisCount: 3,
-                            childAspectRatio: 2.2,
-                            crossAxisSpacing: 8,
-                            mainAxisSpacing: 8,
-                          ),
-                          itemCount: _webShortcuts.length,
-                          itemBuilder: (context, index) {
-                            final item = _webShortcuts[index];
-                            return InkWell(
-                              onTap: () => _openWebUrl(item.url),
-                              borderRadius: BorderRadius.circular(8),
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF1E293B),
-                                  borderRadius: BorderRadius.circular(8),
-                                  border: Border.all(color: const Color(0xFF334155)),
-                                ),
-                                child: Row(
-                                  children: [
-                                    Icon(item.icon, size: 20, color: const Color(0xFF38BDF8)),
-                                    const SizedBox(width: 6),
-                                    Expanded(
-                                      child: Text(
-                                        item.name,
-                                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-
-                  SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('LAUNCH ANY APP OR DESKTOP SHORTCUT', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _customAppController,
-                                style: const TextStyle(color: Colors.white, fontSize: 13),
-                                decoration: const InputDecoration(
-                                  hintText: 'e.g. chrome, steam, discord, calc, notepad',
-                                  contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 0),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            ElevatedButton(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF0284C7),
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: () => _launchApp(_customAppController.text),
-                              child: const Text('Launch'),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 16),
-                        const Text('POPULAR PC APPLICATIONS', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: [
-                            _buildAppLaunchChip('File Explorer', 'explorer', Icons.folder),
-                            _buildAppLaunchChip('Desktop Folder', 'explorer shell:Desktop', Icons.desktop_windows),
-                            _buildAppLaunchChip('Task Manager', 'taskmgr', Icons.analytics),
-                            _buildAppLaunchChip('Chrome', 'chrome', Icons.public),
-                            _buildAppLaunchChip('Command Prompt', 'cmd', Icons.terminal),
-                            _buildAppLaunchChip('PowerShell', 'powershell', Icons.code),
-                            _buildAppLaunchChip('Notepad', 'notepad', Icons.description),
-                            _buildAppLaunchChip('Calculator', 'calc', Icons.calculate),
-                            _buildAppLaunchChip('Settings', 'ms-settings:', Icons.settings),
-                            _buildAppLaunchChip('Steam', 'steam', Icons.sports_esports),
-                            _buildAppLaunchChip('Spotify', 'spotify', Icons.music_note),
-                            _buildAppLaunchChip('Discord', 'discord', Icons.chat),
-                            _buildAppLaunchChip('VS Code', 'code', Icons.integration_instructions),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.all(12),
+      child: ListView(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'QUICK WEBSITES',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
               ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildAppLaunchChip(String label, String cmd, IconData icon) {
-    return ActionChip(
-      backgroundColor: const Color(0xFF1E293B),
-      side: const BorderSide(color: Color(0xFF334155)),
-      avatar: Icon(icon, size: 16, color: const Color(0xFF38BDF8)),
-      label: Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
-      onPressed: () => _launchApp(cmd),
-    );
-  }
-
-  /// TAB 3: Administrator Portal with Password Gate (Sagiv_2311)
-  Widget _buildAdminTab() {
-    if (!_isConnected) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: const [
-              Icon(Icons.link_off, size: 48, color: Color(0xFF64748B)),
-              SizedBox(height: 12),
-              Text(
-                'Connect to PC First',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'Connect to your PC host server above before accessing the Administrator Portal.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+              TextButton.icon(
+                icon: const Icon(Icons.add, size: 16, color: Color(0xFF38BDF8)),
+                label: const Text('Add Shortcut', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 12)),
+                onPressed: _showAddShortcutDialog,
               ),
             ],
           ),
-        ),
-      );
-    }
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: _webShortcuts
+                .map((item) => ActionChip(
+                      backgroundColor: const Color(0xFF1E293B),
+                      side: const BorderSide(color: Color(0xFF334155)),
+                      avatar: Icon(item.icon, size: 18, color: const Color(0xFF38BDF8)),
+                      label: Text(item.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                      onPressed: _isConnected ? () => _openUrl(item.url) : null,
+                    ))
+                .toList(),
+          ),
 
+          const SizedBox(height: 20),
+          const Text(
+            'LAUNCH PC APPS',
+            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+          const SizedBox(height: 8),
+
+          GridView.count(
+            crossAxisCount: 3,
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            childAspectRatio: 2.2,
+            children: [
+              _buildAppTile('Chrome', 'chrome', Icons.travel_explore),
+              _buildAppTile('Edge', 'edge', Icons.language),
+              _buildAppTile('Explorer', 'explorer', Icons.folder_open),
+              _buildAppTile('Task Manager', 'taskmgr', Icons.analytics),
+              _buildAppTile('Notepad', 'notepad', Icons.edit_note),
+              _buildAppTile('Calculator', 'calculator', Icons.calculate),
+              _buildAppTile('Terminal (CMD)', 'cmd', Icons.terminal),
+            ],
+          ),
+
+          const SizedBox(height: 20),
+          const Text(
+            'KEYBOARD INPUT TO PC',
+            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+          const SizedBox(height: 8),
+
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _textController,
+                  focusNode: _textFocusNode,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(
+                    hintText: 'Type text here to send to PC...',
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                  onSubmitted: _sendText,
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF0284C7),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                ),
+                onPressed: _isConnected ? () => _sendText(_textController.text) : null,
+                icon: const Icon(Icons.send, size: 16),
+                label: const Text('Send'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAppTile(String label, String appCmd, IconData icon) {
+    return ElevatedButton.icon(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: const Color(0xFF1E293B),
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      onPressed: _isConnected ? () => _launchApp(appCmd) : null,
+      icon: Icon(icon, size: 18, color: const Color(0xFF38BDF8)),
+      label: Text(label, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis),
+    );
+  }
+
+  /// TAB 3: Administrator Security Portal (Password: Sagiv_2311)
+  Widget _buildAdminTab() {
     if (!_isAdminAuthenticated) {
       return Center(
         child: SingleChildScrollView(
@@ -2105,9 +2475,9 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             decoration: BoxDecoration(
               color: const Color(0xFF1E293B),
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: const Color(0xFF0284C7).withOpacity(0.5), width: 1.5),
+              border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.4)),
               boxShadow: [
-                BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 16, offset: const Offset(0, 6)),
+                BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 15, offset: const Offset(0, 4)),
               ],
             ),
             child: Column(
@@ -2119,64 +2489,51 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     color: const Color(0xFF0284C7).withOpacity(0.2),
                     shape: BoxShape.circle,
                   ),
-                  child: const Icon(Icons.admin_panel_settings, size: 42, color: Color(0xFF38BDF8)),
+                  child: const Icon(Icons.admin_panel_settings, color: Color(0xFF38BDF8), size: 48),
                 ),
                 const SizedBox(height: 16),
                 const Text(
-                  'ADMINISTRATOR ACCESS',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                    color: Colors.white,
-                  ),
+                  'Administrator Portal',
+                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 6),
+                const SizedBox(height: 8),
                 const Text(
-                  'Enter password to manage connected phones, disconnect devices, and apply persistent remote locks.',
+                  'Enter password to view all connected devices, disconnect users, and lock phone apps.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                 ),
                 const SizedBox(height: 20),
-
                 TextField(
                   controller: _adminPasswordController,
                   obscureText: _obscureAdminPassword,
-                  autofocus: false,
                   style: const TextStyle(color: Colors.white),
-                  onSubmitted: (_) => _authenticateAdmin(),
                   decoration: InputDecoration(
                     labelText: 'Admin Password',
-                    prefixIcon: const Icon(Icons.vpn_key, color: Color(0xFF38BDF8), size: 18),
+                    prefixIcon: const Icon(Icons.key, color: Color(0xFF38BDF8), size: 20),
                     suffixIcon: IconButton(
                       icon: Icon(
-                        _obscureAdminPassword ? Icons.visibility : Icons.visibility_off,
+                        _obscureAdminPassword ? Icons.visibility_off : Icons.visibility,
                         color: const Color(0xFF94A3B8),
-                        size: 18,
                       ),
                       onPressed: () => setState(() => _obscureAdminPassword = !_obscureAdminPassword),
                     ),
                   ),
+                  onSubmitted: (_) => _submitAdminAuth(),
                 ),
                 const SizedBox(height: 16),
-
                 SizedBox(
                   width: double.infinity,
                   height: 44,
                   child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0284C7),
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                    onPressed: _isAdminAuthenticating ? null : _authenticateAdmin,
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+                    onPressed: _isConnected && !_isAdminAuthenticating ? _submitAdminAuth : null,
                     child: _isAdminAuthenticating
                         ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                           )
-                        : const Text('Unlock Admin Portal', style: TextStyle(fontWeight: FontWeight.bold)),
+                        : const Text('Unlock Admin Access', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ],
@@ -2187,8 +2544,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
     }
 
     return Container(
-      color: const Color(0xFF0B1120),
-      padding: const EdgeInsets.all(14.0),
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2197,32 +2554,22 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             children: [
               Row(
                 children: const [
-                  Icon(Icons.security, color: Color(0xFF22C55E), size: 20),
+                  Icon(Icons.security, color: Color(0xFF22C55E), size: 18),
                   SizedBox(width: 8),
                   Text(
-                    'CONNECTED PHONES & DEVICES',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1.1,
-                    ),
+                    'CONNECTED PHONES & PERMISSIONS',
+                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1),
                   ),
                 ],
               ),
               IconButton(
                 icon: const Icon(Icons.refresh, color: Color(0xFF38BDF8), size: 20),
-                tooltip: 'Refresh Clients List',
+                tooltip: 'Refresh list',
                 onPressed: () => _sendJson({'type': 'admin_get_clients'}),
               ),
             ],
           ),
-          const SizedBox(height: 4),
-          const Text(
-            'Control access permissions for every device on your PC server.',
-            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
-          ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
 
           Expanded(
             child: _connectedPhones.isEmpty
@@ -2230,130 +2577,206 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: const [
-                        Icon(Icons.phonelink_off, size: 48, color: Color(0xFF475569)),
-                        SizedBox(height: 12),
-                        Text('No phones currently connected', style: TextStyle(color: Color(0xFF94A3B8))),
+                        Icon(Icons.phone_android, size: 40, color: Color(0xFF475569)),
+                        SizedBox(height: 8),
+                        Text('No other phones connected to PC', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13)),
                       ],
                     ),
                   )
                 : ListView.builder(
                     itemCount: _connectedPhones.length,
-                    itemBuilder: (context, index) {
-                      final phone = _connectedPhones[index];
-                      final isCurrentPhone = phone.id == _myClientId;
+                    itemBuilder: (ctx, idx) {
+                      final phone = _connectedPhones[idx];
+                      final isMe = phone.id == _myClientId;
 
                       return Container(
-                        margin: const EdgeInsets.only(bottom: 10),
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
                           color: const Color(0xFF1E293B),
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(
                             color: phone.isLocked
                                 ? const Color(0xFFEF4444)
-                                : (isCurrentPhone ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
-                            width: phone.isLocked || isCurrentPhone ? 1.5 : 1,
+                                : (isMe ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
                           ),
                         ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-                          leading: CircleAvatar(
-                            backgroundColor: phone.isLocked
-                                ? const Color(0xFFEF4444).withOpacity(0.2)
-                                : const Color(0xFF0284C7).withOpacity(0.2),
-                            child: Icon(
-                              phone.isLocked ? Icons.lock : Icons.smartphone,
-                              color: phone.isLocked ? const Color(0xFFEF4444) : const Color(0xFF38BDF8),
-                              size: 22,
-                            ),
-                          ),
-                          title: Row(
-                            children: [
-                              Text(
-                                phone.deviceName,
-                                style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 14),
+                        child: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: phone.isLocked
+                                    ? const Color(0xFFEF4444).withOpacity(0.2)
+                                    : const Color(0xFF0284C7).withOpacity(0.2),
+                                shape: BoxShape.circle,
                               ),
-                              if (isCurrentPhone) ...[
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF0284C7).withOpacity(0.3),
-                                    borderRadius: BorderRadius.circular(4),
+                              child: Icon(
+                                phone.isLocked ? Icons.lock : Icons.phone_android,
+                                color: phone.isLocked ? const Color(0xFFEF4444) : const Color(0xFF38BDF8),
+                                size: 20,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Text(
+                                        phone.deviceName,
+                                        style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 13),
+                                      ),
+                                      if (isMe) ...[
+                                        const SizedBox(width: 6),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF0284C7),
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: const Text('THIS PHONE', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold)),
+                                        ),
+                                      ],
+                                    ],
                                   ),
-                                  child: const Text('THIS PHONE', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 10, fontWeight: FontWeight.bold)),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'IP: ${phone.ip} • Device ID: ${phone.deviceId.length > 18 ? phone.deviceId.substring(0, 18) : phone.deviceId}',
+                                    style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                                  ),
+                                  if (phone.isLocked) ...[
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      phone.lockedUntil == 0
+                                          ? 'Status: Locked indefinitely until unlocked'
+                                          : 'Status: Locked until ${DateTime.fromMillisecondsSinceEpoch(phone.lockedUntil * 1000).toLocal().toString().substring(11, 16)}',
+                                      style: const TextStyle(color: Color(0xFFFCA5A5), fontSize: 10, fontWeight: FontWeight.bold),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (phone.isLocked)
+                                  IconButton(
+                                    icon: const Icon(Icons.lock_open, color: Color(0xFF22C55E), size: 20),
+                                    tooltip: 'Unlock Phone',
+                                    onPressed: () {
+                                      _sendJson({'type': 'admin_unlock_client', 'target_id': phone.id});
+                                      _showToast('Unlocked ${phone.deviceName}');
+                                    },
+                                  )
+                                else
+                                  IconButton(
+                                    icon: const Icon(Icons.lock_outline, color: Color(0xFFF59E0B), size: 20),
+                                    tooltip: 'Lock Phone',
+                                    onPressed: () => _showLockDurationDialog(phone.id, phone.deviceName),
+                                  ),
+                                IconButton(
+                                  icon: const Icon(Icons.link_off, color: Color(0xFFEF4444), size: 20),
+                                  tooltip: 'Disconnect Phone',
+                                  onPressed: () {
+                                    _sendJson({'type': 'admin_disconnect_client', 'target_id': phone.id});
+                                    _showToast('Disconnected ${phone.deviceName}');
+                                  },
                                 ),
                               ],
-                            ],
-                          ),
-                          subtitle: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const SizedBox(height: 2),
-                              Text('IP: ${phone.ip} • ID: #${phone.id}', style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11)),
-                              const SizedBox(height: 2),
-                              Text(
-                                phone.isLocked
-                                    ? (phone.lockedUntil > 0 ? 'STATUS: LOCKED (Timed)' : 'STATUS: LOCKED (Indefinite)')
-                                    : 'STATUS: ACTIVE (Connected)',
-                                style: TextStyle(
-                                  color: phone.isLocked ? const Color(0xFFEF4444) : const Color(0xFF22C55E),
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (phone.isLocked)
-                                TextButton.icon(
-                                  style: TextButton.styleFrom(
-                                    foregroundColor: const Color(0xFF22C55E),
-                                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                                  ),
-                                  onPressed: () {
-                                    _sendJson({
-                                      'type': 'admin_unlock_client',
-                                      'target_id': phone.id,
-                                    });
-                                    _showToast('Unlocked ${phone.deviceName}');
-                                  },
-                                  icon: const Icon(Icons.lock_open, size: 16),
-                                  label: const Text('Unlock', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                                )
-                              else
-                                TextButton.icon(
-                                  style: TextButton.styleFrom(
-                                    foregroundColor: const Color(0xFFF59E0B),
-                                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                                  ),
-                                  onPressed: () => _showLockDurationPicker(phone.id, phone.deviceName),
-                                  icon: const Icon(Icons.lock, size: 16),
-                                  label: const Text('Lock App', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                                ),
-
-                              const SizedBox(width: 4),
-
-                              IconButton(
-                                icon: const Icon(Icons.power_settings_new, color: Color(0xFFEF4444), size: 20),
-                                tooltip: 'Disconnect Phone (Can reconnect)',
-                                onPressed: () {
-                                  _sendJson({
-                                    'type': 'admin_disconnect_client',
-                                    'target_id': phone.id,
-                                  });
-                                  _showToast('Disconnected #${phone.id}');
-                                },
-                              ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
                       );
                     },
                   ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Full-Screen Lock Overlay shown when device is locked by administrator
+  Widget _buildLockedScreen() {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F172A),
+      body: Center(
+        child: Container(
+          margin: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(24),
+          constraints: const BoxConstraints(maxWidth: 440),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E293B),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFFEF4444), width: 2),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.6), blurRadius: 20),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.lock_person, size: 64, color: Color(0xFFEF4444)),
+              const SizedBox(height: 16),
+              const Text(
+                'APP ACCESS LOCKED',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 1.2),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'This device has been temporarily locked by the PC administrator.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+
+              if (_remainingLockSeconds > 0) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.timer, color: Color(0xFFF59E0B), size: 18),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Unlocks in: ${_remainingLockSeconds ~/ 60}m ${_remainingLockSeconds % 60}s',
+                        style: const TextStyle(color: Color(0xFFF59E0B), fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Text(
+                    'Locked until unlocked by Administrator',
+                    style: TextStyle(color: Color(0xFFEF4444), fontWeight: FontWeight.bold, fontSize: 12),
+                  ),
+                ),
+              ],
+
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF334155),
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: _showAdminLoginDialog,
+                icon: const Icon(Icons.admin_panel_settings, size: 16),
+                label: const Text('Admin Unlock'),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

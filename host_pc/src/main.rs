@@ -2026,6 +2026,7 @@ async fn handle_connection(
             Ok(Message::Close(_)) => {
                 break;
             }
+            Ok(_) => {}
             Err(_) => {
                 break;
             }

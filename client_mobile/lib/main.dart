@@ -272,6 +272,8 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             _localLockFile.deleteSync();
           }
         }
+      }
+
       // Load saved custom shortcuts from disk
       _loadSavedWebShortcuts();
     } catch (_) {}

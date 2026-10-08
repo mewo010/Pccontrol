@@ -1,0 +1,6 @@
+{
+  "name": "Remote PC Controller & Screen Mirroring Suite",
+  "description": "High-performance low-latency remote desktop server in Rust (DXGI GPU capture + TokIO WebSocket) and client in Flutter/Dart (Android 60-120 FPS mirror, touch-to-coordinate mapping, remote input injection) with GitHub Actions CI/CD pipeline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -2127,6 +2127,26 @@ fn execute_key_shortcut(en: &mut Enigo, key: &str) {
         "volume_up" => { let _ = en.key(Key::VolumeUp, Direction::Click); }
         "volume_down" => { let _ = en.key(Key::VolumeDown, Direction::Click); }
         "volume_mute" => { let _ = en.key(Key::VolumeMute, Direction::Click); }
+        "lock_pc" => {
+            let _ = en.key(Key::Meta, Direction::Press);
+            let _ = en.key(Key::Unicode('l'), Direction::Click);
+            let _ = en.key(Key::Meta, Direction::Release);
+        }
+        "sleep_pc" => {
+            let _ = Command::new("cmd")
+                .args(["/C", "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"])
+                .spawn();
+        }
+        "restart_pc" => {
+            let _ = Command::new("cmd")
+                .args(["/C", "shutdown /r /t 5"])
+                .spawn();
+        }
+        "shutdown_pc" => {
+            let _ = Command::new("cmd")
+                .args(["/C", "shutdown /s /t 5"])
+                .spawn();
+        }
         _ => {}
     }
 }

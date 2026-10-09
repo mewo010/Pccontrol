@@ -1478,6 +1478,10 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
             label: 'Apps & Web',
           ),
           BottomNavigationBarItem(
+            icon: Icon(Icons.settings_remote),
+            label: 'Media & Power',
+          ),
+          BottomNavigationBarItem(
             icon: Icon(Icons.admin_panel_settings),
             label: 'Admin',
           ),
@@ -1623,10 +1627,214 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
       case 2:
         return _buildShortcutsAndAppsTab();
       case 3:
+        return _buildMediaAndPowerTab();
+      case 4:
         return _buildAdminTab();
       default:
         return _buildDedicatedTouchpadTab();
     }
+  }
+
+  /// TAB 3: Media Remote & PC Power Control
+  Widget _buildMediaAndPowerTab() {
+    return Container(
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.all(16),
+      child: ListView(
+        children: [
+          const Text(
+            'MEDIA REMOTE & VOLUME CONTROL',
+            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+          const SizedBox(height: 12),
+
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E293B),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.4)),
+            ),
+            child: Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    IconButton.filledTonal(
+                      iconSize: 32,
+                      icon: const Icon(Icons.skip_previous, color: Color(0xFF38BDF8)),
+                      onPressed: _isConnected ? () => _sendKey('media_prev') : null,
+                    ),
+                    IconButton.filled(
+                      iconSize: 44,
+                      style: IconButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+                      icon: const Icon(Icons.play_arrow, color: Colors.white),
+                      onPressed: _isConnected ? () => _sendKey('media_play_pause') : null,
+                    ),
+                    IconButton.filledTonal(
+                      iconSize: 32,
+                      icon: const Icon(Icons.skip_next, color: Color(0xFF38BDF8)),
+                      onPressed: _isConnected ? () => _sendKey('media_next') : null,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Divider(color: Color(0xFF334155)),
+                const SizedBox(height: 12),
+
+                Row(
+                  children: [
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF334155),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      ),
+                      onPressed: _isConnected ? () => _sendKey('volume_mute') : null,
+                      icon: const Icon(Icons.volume_off, size: 18, color: Color(0xFFF59E0B)),
+                      label: const Text('Mute'),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF0284C7),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        ),
+                        onPressed: _isConnected ? () => _sendKey('volume_down') : null,
+                        icon: const Icon(Icons.volume_down, size: 18),
+                        label: const Text('Vol -'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF0284C7),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        ),
+                        onPressed: _isConnected ? () => _sendKey('volume_up') : null,
+                        icon: const Icon(Icons.volume_up, size: 18),
+                        label: const Text('Vol +'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 24),
+          const Text(
+            'QUICK SHORTCUTS & WINDOW ACTIONS',
+            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+          const SizedBox(height: 10),
+
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _buildQuickPill('Copy (Ctrl+C)', 'ctrl+c', Icons.copy),
+              _buildQuickPill('Paste (Ctrl+V)', 'ctrl+v', Icons.paste),
+              _buildQuickPill('Select All (Ctrl+A)', 'ctrl+a', Icons.select_all),
+              _buildQuickPill('Undo (Ctrl+Z)', 'ctrl+z', Icons.undo),
+              _buildQuickPill('Close Window (Alt+F4)', 'alt+f4', Icons.close, isPrimary: true),
+            ],
+          ),
+
+          const SizedBox(height: 24),
+          const Text(
+            'SYSTEM POWER & WORKSTATION CONTROL',
+            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+          const SizedBox(height: 10),
+
+          GridView.count(
+            crossAxisCount: 2,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            childAspectRatio: 2.2,
+            children: [
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1E293B),
+                  foregroundColor: const Color(0xFF38BDF8),
+                  side: const BorderSide(color: Color(0xFF38BDF8)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _isConnected ? () => _sendKey('lock_pc') : null,
+                icon: const Icon(Icons.lock, size: 20),
+                label: const Text('Lock PC (Win+L)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1E293B),
+                  foregroundColor: const Color(0xFFA855F7),
+                  side: const BorderSide(color: Color(0xFFA855F7)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _isConnected ? () => _sendKey('sleep_pc') : null,
+                icon: const Icon(Icons.bedtime, size: 20),
+                label: const Text('Sleep PC', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1E293B),
+                  foregroundColor: const Color(0xFFF59E0B),
+                  side: const BorderSide(color: Color(0xFFF59E0B)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _isConnected ? () => _confirmPowerAction('Restart PC', 'restart_pc') : null,
+                icon: const Icon(Icons.restart_alt, size: 20),
+                label: const Text('Restart PC', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1E293B),
+                  foregroundColor: const Color(0xFFEF4444),
+                  side: const BorderSide(color: Color(0xFFEF4444)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _isConnected ? () => _confirmPowerAction('Shutdown PC', 'shutdown_pc') : null,
+                icon: const Icon(Icons.power_settings_new, size: 20),
+                label: const Text('Shut Down PC', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmPowerAction(String title, String keyCmd) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Text('Confirm $title', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Text('Are you sure you want to $title on your Remote PC?', style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 13)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFEF4444)),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _sendKey(keyCmd);
+              _showToast('Sent $title signal to PC');
+            },
+            child: Text('Yes, $title'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// TAB 0: Dedicated Laptop Touchpad UI

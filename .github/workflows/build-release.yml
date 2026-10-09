@@ -90,9 +90,56 @@ jobs:
           path: client_mobile/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
 
+  build-flutter-ios:
+    name: Build iOS Client (.ipa)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Scaffold iOS Project & Permissions
+        working-directory: client_mobile
+        run: |
+          rm -rf ios
+          flutter create . --platforms=ios --org com.remotepc
+          
+          # Inject Local Network permissions into generated Info.plist
+          PLIST="ios/Runner/Info.plist"
+          if [ -f "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 'Remote PC Controller needs local network access to discover and connect to your PC.'" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :NSBonjourServices array" "$PLIST" || true
+            /usr/libexec/PlistBuddy -c "Add :NSBonjourServices:0 string '_http._tcp'" "$PLIST" || true
+          fi
+          flutter pub get
+
+      - name: Build Unsigned iOS App & Package IPA
+        working-directory: client_mobile
+        run: |
+          flutter build ios --release --no-codesign
+          mkdir -p build/ios/ipa/Payload
+          cp -r build/ios/iphoneos/Runner.app build/ios/ipa/Payload/
+          cd build/ios/ipa
+          zip -r RemotePC-Client-iOS.ipa Payload
+          echo "iOS IPA package created successfully:"
+          ls -lh RemotePC-Client-iOS.ipa
+
+      - name: Upload iOS IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-client-ipa
+          path: client_mobile/build/ios/ipa/RemotePC-Client-iOS.ipa
+          if-no-files-found: error
+
   create-github-release:
     name: Publish Unified GitHub Release
-    needs: [build-rust-host, build-flutter-client]
+    needs: [build-rust-host, build-flutter-client, build-flutter-ios]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -129,12 +176,15 @@ jobs:
           - **Multi-Engine Desktop Fallback**: GDI Direct DIBSection ➔ GDI Compatible Bitmap ➔ XCap DXGI Desktop Duplication ➔ Animated Diagnostic Test Pattern.
           - **Outside Wi-Fi WAN Access**: Automatically detects public WAN IP and configures router port 8765 TCP via UPnP.
           - **Sleeping Display Wakeup**: Detects sleeping PC monitors or locked displays, waking them up upon mobile request.
+          - **PC Power Control**: Remote Lock Workstation (\`Win+L\`), Sleep PC, Restart PC, and Shutdown PC.
           - **Admin Security Portal**: Protected with password \`Sagiv_2311\`, with persistent device locking across app restarts.
 
-          #### 📱 Android Client App (\`RemotePC-Client-Android.apk\`)
+          #### 📱 Android & iOS Client Apps (\`RemotePC-Client-Android.apk\` & \`RemotePC-Client-iOS.ipa\`)
           - **Seamless Outside-of-WiFi Reconnection**: Connect once on Home Wi-Fi; if you step outside or turn off Wi-Fi, the app automatically fails over to Mobile Data (4G/5G) and stays connected!
+          - **NEW Media & Power Remote Tab**: Dedicated playback transport buttons (Play/Pause, Next, Prev), Volume step up/down, Mute toggle, and PC System Power Controls (Lock, Sleep, Restart, Shutdown).
           - **"Why Can't I See The Screen?" Live Diagnostics**: Root-cause diagnostic center with 4-point health check (Network Link, PC Capture Engine, Frame Delivery, Win32 errors) and 1-tap repair buttons.
           - **Full Touchpad & Controls**: Laptop-style touchpad with glide sensitivity, left/right click, scroll strip, shortcuts, and app launcher.
+          - **Persistent Custom Web Shortcuts**: Save, load, and delete custom website shortcuts on disk.
           - **Admin Management Portal**: Real-time connected client inspector, remote disconnection, and device lock management.
 
           ---
@@ -142,6 +192,7 @@ jobs:
           ### 📥 Download Prebuilt Binaries
           - **Windows PC**: Download **\`RemotePC-Host-Windows.exe\`** (double-click to run, auto-elevates UAC).
           - **Android Phone**: Download **\`RemotePC-Client-Android.apk\`** (tap to install on phone/tablet).
+          - **iPhone / iPad**: Download **\`RemotePC-Client-iOS.ipa\`** (install via AltStore, Sideloadly, TrollStore, or Xcode).
           EOF
 
       - name: Create Artifacts Staging Directory
@@ -159,10 +210,17 @@ jobs:
           name: android-client-apk
           path: download_client
 
+      - name: Download iOS Client Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-client-ipa
+          path: download_ios
+
       - name: Stage & Verify Release Assets
         run: |
           find download_host -type f -name "*.exe" -exec cp {} release_assets/RemotePC-Host-Windows.exe \;
           find download_client -type f -name "*.apk" -exec cp {} release_assets/RemotePC-Client-Android.apk \;
+          find download_ios -type f -name "*.ipa" -exec cp {} release_assets/RemotePC-Client-iOS.ipa \;
           echo "Staged release assets:"
           ls -lah release_assets/
 
@@ -178,5 +236,6 @@ jobs:
           files: |
             release_assets/RemotePC-Host-Windows.exe
             release_assets/RemotePC-Client-Android.apk
+            release_assets/RemotePC-Client-iOS.ipa
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

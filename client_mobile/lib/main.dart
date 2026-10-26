@@ -501,7 +501,16 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
     try {
       final uri = Uri.parse(wsUrl);
-      _channel = WebSocketChannel.connect(uri);
+      final channel = WebSocketChannel.connect(uri);
+      _channel = channel;
+      _addLog('Target URL: $wsUrl (waiting up to 6s for socket ready)');
+
+      channel.ready.timeout(const Duration(seconds: 6)).catchError((Object e) {
+        // Ignore late completion after cancel/disconnect or a newer attempt.
+        if (!mounted || !identical(_channel, channel) || _isConnected) return;
+        _addLog('Connection to $wsUrl failed: $e');
+        _handleConnectionDrop('Could not reach $wsUrl (timeout). Check host is running, same Wi-Fi, port 8765.');
+      });
 
       _subscription = _channel!.stream.listen(
         (data) {
@@ -622,6 +631,14 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
 
     if (mounted) {
       setState(() {
+        _totalBinaryFramesReceived = 0;
+        _totalJsonMessagesReceived = 0;
+        _totalBytesReceived = 0;
+        _hostFrameCount = 0;
+        _hostFramesSent = 0;
+        _hostLastError = null;
+        _lastFrameReceivedTime = null;
+        _isScreenBlackDetected = false;
         _isConnected = false;
         _isConnecting = false;
         _isAdminAuthenticated = false;
@@ -2413,6 +2430,77 @@ class _RemoteControllerScreenState extends State<RemoteControllerScreen> {
                   ],
                 ),
               ),
+
+              if (!_isConnected) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.5)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          if (!_isOutsideWifiMode)
+                            ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF1E293B),
+                                foregroundColor: const Color(0xFF38BDF8),
+                                side: const BorderSide(color: Color(0xFF38BDF8)),
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              ),
+                              onPressed: _isScanning ? null : _autoDiscoverPc,
+                              icon: _isScanning
+                                  ? const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Icon(Icons.radar, size: 16),
+                              label: Text(_isScanning ? 'Searching...' : 'Auto-Detect PC', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                            ),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF0284C7),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            ),
+                            onPressed: _isConnecting ? null : _connect,
+                            icon: const Icon(Icons.link, size: 16),
+                            label: Text(
+                              _isConnecting
+                                  ? 'Connecting...'
+                                  : (_ipController.text.trim().isEmpty ? 'Connect' : 'Connect to ${_ipController.text.trim()}'),
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          if (_isConnecting)
+                            OutlinedButton(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFFEF4444),
+                                side: const BorderSide(color: Color(0xFFEF4444)),
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              ),
+                              onPressed: _disconnect,
+                              child: const Text('Cancel', style: TextStyle(fontSize: 12)),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        _statusMessage,
+                        style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 10),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
 
               const SizedBox(height: 16),
 
